@@ -1,7 +1,7 @@
 use mundis_core::{
     config::{SimulationBias, SimulationConfig, WorldSize},
     export::{render_markdown, render_text},
-    simulation::{Simulation, SimulationSeed},
+    simulation::{EventSeverity, Simulation, SimulationEvent, SimulationSeed},
     storage::SaveDatabase,
     world::World,
 };
@@ -71,6 +71,22 @@ fn markdown_is_a_renderer_over_structured_events() {
 }
 
 #[test]
+fn markdown_handles_zero_month_events_without_underflowing() {
+    let events = vec![SimulationEvent {
+        id: 1,
+        month: 0,
+        severity: EventSeverity::Note,
+        tags: vec!["malformed".to_string()],
+        summary: "A malformed event still renders safely.".to_string(),
+    }];
+
+    let markdown = render_markdown(&events);
+
+    assert!(markdown.contains("## Year 1"));
+    assert!(markdown.contains("Month 0"));
+}
+
+#[test]
 fn save_database_persists_metadata_events_and_binary_snapshot() {
     let temp_dir = tempfile::tempdir().expect("temp dir");
     let path = temp_dir.path().join("run.mundis.db");
@@ -91,4 +107,21 @@ fn save_database_persists_metadata_events_and_binary_snapshot() {
         reopened.load_latest_snapshot().expect("load snapshot"),
         snapshot
     );
+}
+
+#[test]
+fn opening_non_mundis_database_reports_clear_error() {
+    let temp_dir = tempfile::tempdir().expect("temp dir");
+    let path = temp_dir.path().join("not-mundis.db");
+    let connection = rusqlite::Connection::open(&path).expect("create sqlite db");
+    connection
+        .execute("CREATE TABLE unrelated (id INTEGER PRIMARY KEY)", [])
+        .expect("create unrelated table");
+    drop(connection);
+
+    let error = SaveDatabase::open(&path)
+        .err()
+        .expect("open should reject non-Mundis db");
+
+    assert!(error.to_string().contains("not a Mundis save database"));
 }

@@ -15,7 +15,7 @@ pub fn render_markdown(events: &[SimulationEvent]) -> String {
     let mut current_year = None;
 
     for event in events {
-        let year = ((event.month - 1) / 12) + 1;
+        let year = event.month.saturating_sub(1) / 12 + 1;
         if current_year != Some(year) {
             current_year = Some(year);
             let _ = writeln!(output, "\n## Year {}", year);

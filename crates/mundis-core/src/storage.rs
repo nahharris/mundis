@@ -1,6 +1,6 @@
 use std::{error::Error, path::Path};
 
-use rusqlite::{Connection, params};
+use rusqlite::{Connection, OptionalExtension, params};
 
 use crate::{
     config::SimulationConfig,
@@ -31,11 +31,30 @@ impl SaveDatabase {
     pub fn open(path: &Path) -> StorageResult<Self> {
         let connection = Connection::open(path)?;
         let db = Self { connection };
-        let version: String = db.connection.query_row(
-            "SELECT value FROM metadata WHERE key = 'schema_version'",
-            [],
-            |row| row.get(0),
-        )?;
+        let has_metadata_table = db
+            .connection
+            .query_row(
+                "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'metadata'",
+                [],
+                |_| Ok(()),
+            )
+            .optional()?
+            .is_some();
+        if !has_metadata_table {
+            return Err("not a Mundis save database: missing metadata table".into());
+        }
+
+        let Some(version) = db
+            .connection
+            .query_row(
+                "SELECT value FROM metadata WHERE key = 'schema_version'",
+                [],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?
+        else {
+            return Err("not a Mundis save database: missing schema_version".into());
+        };
         let version = version.parse::<i64>()?;
         if version != SCHEMA_VERSION {
             return Err(format!("unsupported save schema version {version}").into());
@@ -46,13 +65,14 @@ impl SaveDatabase {
     pub fn append_events(&self, events: &[SimulationEvent]) -> StorageResult<()> {
         for event in events {
             let payload = bincode::serde::encode_to_vec(event, bincode::config::standard())?;
+            let severity = format!("{:?}", &event.severity);
             self.connection.execute(
                 "INSERT INTO events (id, month, severity, summary, payload) VALUES (?1, ?2, ?3, ?4, ?5)",
                 params![
                     event.id as i64,
                     event.month as i64,
-                    format!("{:?}", event.severity),
-                    event.summary,
+                    severity,
+                    &event.summary,
                     payload
                 ],
             )?;

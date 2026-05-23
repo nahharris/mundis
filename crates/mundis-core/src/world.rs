@@ -23,7 +23,7 @@ pub struct Region {
     pub neighbors: Vec<RegionId>,
 }
 
-pub type RegionId = u32;
+pub type RegionId = usize;
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
@@ -67,19 +67,19 @@ impl World {
             let mut neighbors = Vec::new();
 
             if index > 0 {
-                neighbors.push((index - 1) as RegionId);
+                neighbors.push(index - 1);
             }
             if index + 1 < count {
-                neighbors.push((index + 1) as RegionId);
+                neighbors.push(index + 1);
             }
             if count > 3 && index % 3 == 0 {
-                neighbors.push(((index + 2) % count) as RegionId);
+                neighbors.push((index + 2) % count);
             }
             neighbors.sort_unstable();
             neighbors.dedup();
 
             regions.push(Region {
-                id: index as RegionId,
+                id: index,
                 name: generate_name(&mut rng),
                 carrying_capacity: carrying_capacity(&biome, &mut rng),
                 resources: resources_for(&biome, &mut rng),
@@ -107,7 +107,7 @@ impl World {
             seen[index] = true;
 
             for neighbor in &self.regions[index].neighbors {
-                let neighbor = *neighbor as usize;
+                let neighbor = *neighbor;
                 if neighbor < self.regions.len() && !seen[neighbor] {
                     stack.push(neighbor);
                 }

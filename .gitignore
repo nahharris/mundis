@@ -1,2 +1,3 @@
 /target/
 *.mundis.db
+/simulations/
