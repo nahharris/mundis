@@ -4,6 +4,8 @@ use serde::{Deserialize, Serialize};
 pub struct SimulationConfig {
     pub months: u32,
     pub world: WorldSize,
+    #[serde(default)]
+    pub civilization: CivilizationConfig,
     pub living_history: LivingHistoryConfig,
     pub bias: SimulationBias,
     pub output: OutputConfig,
@@ -22,6 +24,17 @@ pub struct LivingHistoryConfig {
     pub migration_pressure_threshold_per_mille: u32,
     pub decline_pressure_threshold_per_mille: u32,
     pub migrant_split_per_mille: u32,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CivilizationConfig {
+    pub enabled: bool,
+    pub polity_foundation_population: u64,
+    pub expansion_pressure_threshold_per_mille: u32,
+    pub trade_interval_months: u32,
+    pub tension_interval_months: u32,
+    pub cultural_drift_interval_months: u32,
+    pub collapse_cohesion_threshold: i32,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -50,11 +63,26 @@ impl Default for SimulationConfig {
         Self {
             months: 120,
             world: WorldSize { regions: 6 },
+            civilization: CivilizationConfig::default(),
             living_history: LivingHistoryConfig::default(),
             bias: SimulationBias::Plausible,
             output: OutputConfig {
                 verbosity: OutputVerbosity::Chronicle,
             },
+        }
+    }
+}
+
+impl Default for CivilizationConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            polity_foundation_population: 500,
+            expansion_pressure_threshold_per_mille: 900,
+            trade_interval_months: 12,
+            tension_interval_months: 12,
+            cultural_drift_interval_months: 24,
+            collapse_cohesion_threshold: 0,
         }
     }
 }

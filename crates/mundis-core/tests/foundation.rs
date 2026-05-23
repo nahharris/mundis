@@ -1,5 +1,8 @@
 use mundis_core::{
-    config::{LivingHistoryConfig, SimulationBias, SimulationConfig, WorldSize},
+    civilization::PolityStatus,
+    config::{
+        CivilizationConfig, LivingHistoryConfig, SimulationBias, SimulationConfig, WorldSize,
+    },
     export::{render_json, render_markdown, render_text},
     simulation::{
         EventSeverity, EventSubject, EventType, SettlementStatus, Simulation, SimulationEvent,
@@ -505,8 +508,380 @@ fn emitted_event_subjects_reference_existing_state_entities() {
                         .iter()
                         .any(|group| group.id == *id)
                 ),
+                EventSubject::Culture(id) => assert!(
+                    snapshot
+                        .state
+                        .cultures
+                        .iter()
+                        .any(|culture| culture.id == *id)
+                ),
+                EventSubject::Polity(id) => assert!(
+                    snapshot
+                        .state
+                        .polities
+                        .iter()
+                        .any(|polity| polity.id == *id)
+                ),
             }
         }
+    }
+}
+
+#[test]
+fn old_toml_configs_parse_with_civilization_defaults() {
+    let input = r#"
+months = 24
+bias = "plausible"
+
+[world]
+regions = 8
+
+[living_history]
+initial_settlements = 2
+initial_population_per_mille = 250
+monthly_growth_per_mille = 8
+migration_pressure_threshold_per_mille = 1100
+decline_pressure_threshold_per_mille = 1600
+migrant_split_per_mille = 200
+
+[output]
+verbosity = "chronicle"
+"#;
+
+    let config = SimulationConfig::from_toml(input).expect("old config parses");
+
+    assert_eq!(config.civilization, CivilizationConfig::default());
+}
+
+#[test]
+fn simulation_initializes_cultures_for_population_groups() {
+    let config = SimulationConfig {
+        world: WorldSize { regions: 6 },
+        living_history: LivingHistoryConfig {
+            initial_settlements: 2,
+            initial_population_per_mille: 400,
+            ..LivingHistoryConfig::default()
+        },
+        ..SimulationConfig::default()
+    };
+
+    let first = Simulation::new(config.clone(), SimulationSeed::from_u64(42));
+    let second = Simulation::new(config, SimulationSeed::from_u64(42));
+    let snapshot = first.snapshot();
+
+    assert_eq!(first.snapshot(), second.snapshot());
+    assert_eq!(snapshot.state.cultures.len(), 2);
+    assert!(
+        snapshot
+            .state
+            .population_groups
+            .iter()
+            .all(|group| group.culture.is_some())
+    );
+    for culture in &snapshot.state.cultures {
+        assert!(!culture.name.is_empty());
+        assert!(!culture.traits.is_empty());
+        assert!(culture.origin_region < snapshot.state.world.regions.len());
+    }
+}
+
+#[test]
+fn disabled_civilization_layer_leaves_identity_state_empty() {
+    let config = SimulationConfig {
+        civilization: CivilizationConfig {
+            enabled: false,
+            ..CivilizationConfig::default()
+        },
+        ..SimulationConfig::default()
+    };
+    let mut simulation = Simulation::new(config.clone(), SimulationSeed::from_u64(42));
+
+    let events = simulation.run_months(config.months);
+    let snapshot = simulation.snapshot();
+
+    assert!(snapshot.state.cultures.is_empty());
+    assert!(snapshot.state.polities.is_empty());
+    assert!(
+        snapshot
+            .state
+            .population_groups
+            .iter()
+            .all(|group| group.culture.is_none())
+    );
+    assert!(
+        events
+            .iter()
+            .all(|event| event.event_type != EventType::PolityFounded)
+    );
+}
+
+#[test]
+fn seeded_runs_found_polities_with_valid_ownership() {
+    let config = SimulationConfig {
+        months: 1,
+        world: WorldSize { regions: 5 },
+        living_history: LivingHistoryConfig {
+            initial_settlements: 2,
+            initial_population_per_mille: 900,
+            monthly_growth_per_mille: 0,
+            ..LivingHistoryConfig::default()
+        },
+        civilization: CivilizationConfig {
+            polity_foundation_population: 100,
+            ..CivilizationConfig::default()
+        },
+        ..SimulationConfig::default()
+    };
+    let mut simulation = Simulation::new(config.clone(), SimulationSeed::from_u64(12));
+
+    let events = simulation.run_months(config.months);
+    let snapshot = simulation.snapshot();
+
+    assert!(
+        events
+            .iter()
+            .any(|event| event.event_type == EventType::PolityFounded)
+    );
+    assert!(!snapshot.state.polities.is_empty());
+    for polity in &snapshot.state.polities {
+        assert_eq!(polity.status, PolityStatus::Active);
+        assert!(polity.primary_culture < snapshot.state.cultures.len());
+        assert!(polity.capital < snapshot.state.settlements.len());
+        assert!(!polity.controlled_settlements.is_empty());
+        for settlement_id in &polity.controlled_settlements {
+            assert_eq!(
+                snapshot.state.settlements[*settlement_id].polity,
+                Some(polity.id)
+            );
+        }
+        for region_id in &polity.controlled_regions {
+            assert!(*region_id < snapshot.state.world.regions.len());
+        }
+    }
+}
+
+#[test]
+fn civilization_layer_forms_trade_links_between_neighboring_polities() {
+    let config = SimulationConfig {
+        months: 12,
+        world: WorldSize { regions: 6 },
+        living_history: LivingHistoryConfig {
+            initial_settlements: 3,
+            initial_population_per_mille: 900,
+            monthly_growth_per_mille: 0,
+            ..LivingHistoryConfig::default()
+        },
+        civilization: CivilizationConfig {
+            polity_foundation_population: 100,
+            trade_interval_months: 1,
+            ..CivilizationConfig::default()
+        },
+        ..SimulationConfig::default()
+    };
+    let mut simulation = Simulation::new(config.clone(), SimulationSeed::from_u64(7));
+
+    let events = simulation.run_months(config.months);
+    let snapshot = simulation.snapshot();
+
+    let trade = events
+        .iter()
+        .find(|event| event.event_type == EventType::TradeLinkFormed)
+        .expect("trade link event");
+    assert!(
+        trade
+            .subjects
+            .iter()
+            .filter(|subject| matches!(subject, EventSubject::Polity(_)))
+            .count()
+            >= 2
+    );
+    assert!(!snapshot.state.trade_links.is_empty());
+    for link in &snapshot.state.trade_links {
+        assert!(link.polities.0 < snapshot.state.polities.len());
+        assert!(link.polities.1 < snapshot.state.polities.len());
+    }
+}
+
+#[test]
+fn border_tension_events_are_caused_by_neighboring_polity_pressure() {
+    let config = SimulationConfig {
+        months: 12,
+        world: WorldSize { regions: 4 },
+        living_history: LivingHistoryConfig {
+            initial_settlements: 2,
+            initial_population_per_mille: 1_600,
+            monthly_growth_per_mille: 0,
+            migration_pressure_threshold_per_mille: 3_000,
+            decline_pressure_threshold_per_mille: 4_000,
+            migrant_split_per_mille: 0,
+        },
+        civilization: CivilizationConfig {
+            polity_foundation_population: 100,
+            tension_interval_months: 1,
+            ..CivilizationConfig::default()
+        },
+        ..SimulationConfig::default()
+    };
+    let mut simulation = Simulation::new(config.clone(), SimulationSeed::from_u64(5));
+
+    let events = simulation.run_months(config.months);
+    let tension = events
+        .iter()
+        .find(|event| event.event_type == EventType::BorderTension)
+        .expect("border tension event");
+
+    assert!(
+        tension
+            .causes
+            .iter()
+            .any(|cause| cause.contains("pressure") || cause.contains("border"))
+    );
+    assert!(
+        tension
+            .subjects
+            .iter()
+            .filter(|subject| matches!(subject, EventSubject::Polity(_)))
+            .count()
+            >= 2
+    );
+}
+
+#[test]
+fn cultures_drift_when_they_span_multiple_regions() {
+    let config = SimulationConfig {
+        months: 24,
+        world: WorldSize { regions: 6 },
+        living_history: LivingHistoryConfig {
+            initial_settlements: 1,
+            initial_population_per_mille: 1_700,
+            monthly_growth_per_mille: 10,
+            migration_pressure_threshold_per_mille: 1_050,
+            decline_pressure_threshold_per_mille: 3_000,
+            migrant_split_per_mille: 300,
+        },
+        civilization: CivilizationConfig {
+            cultural_drift_interval_months: 1,
+            polity_foundation_population: 100,
+            ..CivilizationConfig::default()
+        },
+        ..SimulationConfig::default()
+    };
+    let mut simulation = Simulation::new(config.clone(), SimulationSeed::from_u64(9));
+
+    let events = simulation.run_months(config.months);
+
+    assert!(events.iter().any(|event| {
+        event.event_type == EventType::CultureDrift
+            && event
+                .subjects
+                .iter()
+                .any(|subject| matches!(subject, EventSubject::Culture(_)))
+    }));
+}
+
+#[test]
+fn sustained_border_tension_can_collapse_a_polity_and_release_ownership() {
+    let config = SimulationConfig {
+        months: 36,
+        world: WorldSize { regions: 4 },
+        living_history: LivingHistoryConfig {
+            initial_settlements: 2,
+            initial_population_per_mille: 1_800,
+            monthly_growth_per_mille: 0,
+            migration_pressure_threshold_per_mille: 3_000,
+            decline_pressure_threshold_per_mille: 4_000,
+            migrant_split_per_mille: 0,
+        },
+        civilization: CivilizationConfig {
+            polity_foundation_population: 100,
+            tension_interval_months: 1,
+            collapse_cohesion_threshold: 80,
+            ..CivilizationConfig::default()
+        },
+        ..SimulationConfig::default()
+    };
+    let mut simulation = Simulation::new(config.clone(), SimulationSeed::from_u64(5));
+
+    let events = simulation.run_months(config.months);
+    let snapshot = simulation.snapshot();
+    let collapse = events
+        .iter()
+        .find(|event| event.event_type == EventType::PolityCollapse)
+        .expect("polity collapse event");
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| event.event_type == EventType::PolityFounded)
+            .count(),
+        2
+    );
+    let polity_id = collapse
+        .subjects
+        .iter()
+        .find_map(|subject| match subject {
+            EventSubject::Polity(id) => Some(*id),
+            _ => None,
+        })
+        .expect("collapsed polity subject");
+
+    assert_eq!(
+        snapshot.state.polities[polity_id].status,
+        PolityStatus::Collapsed
+    );
+    assert!(
+        snapshot
+            .state
+            .settlements
+            .iter()
+            .all(|settlement| settlement.polity != Some(polity_id))
+    );
+}
+
+#[test]
+fn abandoned_settlements_leave_active_polity_regions_consistent() {
+    let config = SimulationConfig {
+        months: 6,
+        world: WorldSize { regions: 2 },
+        living_history: LivingHistoryConfig {
+            initial_settlements: 2,
+            initial_population_per_mille: 3_000,
+            monthly_growth_per_mille: 0,
+            migration_pressure_threshold_per_mille: 1_050,
+            decline_pressure_threshold_per_mille: 1_100,
+            migrant_split_per_mille: 250,
+        },
+        civilization: CivilizationConfig {
+            polity_foundation_population: 100,
+            collapse_cohesion_threshold: -100,
+            ..CivilizationConfig::default()
+        },
+        ..SimulationConfig::default()
+    };
+    let mut simulation = Simulation::new(config.clone(), SimulationSeed::from_u64(5));
+
+    let events = simulation.run_months(config.months);
+    let snapshot = simulation.snapshot();
+
+    assert!(
+        events
+            .iter()
+            .any(|event| event.event_type == EventType::SettlementAbandoned)
+    );
+    for polity in snapshot
+        .state
+        .polities
+        .iter()
+        .filter(|polity| polity.status == PolityStatus::Active)
+    {
+        assert!(!polity.controlled_settlements.is_empty());
+        let mut expected_regions = polity
+            .controlled_settlements
+            .iter()
+            .map(|settlement_id| snapshot.state.settlements[*settlement_id].region)
+            .collect::<Vec<_>>();
+        expected_regions.sort_unstable();
+        expected_regions.dedup();
+        assert_eq!(polity.controlled_regions, expected_regions);
     }
 }
 
