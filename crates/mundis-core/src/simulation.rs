@@ -161,13 +161,8 @@ impl Simulation {
         let month = self.state.month;
         let mut events = Vec::new();
 
-        let settlement_ids: Vec<SettlementId> = self
-            .state
-            .settlements
-            .iter()
-            .map(|settlement| settlement.id)
-            .collect();
-        for settlement_id in settlement_ids {
+        let initial_settlement_count = self.state.settlements.len();
+        for settlement_id in 0..initial_settlement_count {
             if self
                 .state
                 .settlements
@@ -223,7 +218,7 @@ impl Simulation {
         let mut total_growth = 0;
         for group_id in group_ids {
             let group = &mut self.state.population_groups[group_id];
-            let growth = (group.population * growth_per_mille).max(999) / 1_000;
+            let growth = (group.population * growth_per_mille).div_ceil(1_000);
             group.population += growth;
             total_growth += growth;
         }
@@ -297,6 +292,9 @@ impl Simulation {
         events: &mut Vec<SimulationEvent>,
     ) {
         let migrant_split = self.config.living_history.migrant_split_per_mille as u64;
+        if migrant_split == 0 {
+            return;
+        }
         let origin_region = self.state.settlements[origin_settlement_id].region;
         let origin_group_id = self
             .state
@@ -305,10 +303,13 @@ impl Simulation {
             .find(|group| group.settlement == Some(origin_settlement_id))
             .map(|group| group.id)
             .expect("origin settlement has a population group");
-        let migrants = (self.state.population_groups[origin_group_id].population * migrant_split)
-            .max(999)
-            / 1_000;
-        let migrants = migrants.max(1);
+        let origin_population = self.state.population_groups[origin_group_id].population;
+        let migrants = (origin_population * migrant_split)
+            .div_ceil(1_000)
+            .min(origin_population);
+        if migrants == 0 {
+            return;
+        }
 
         self.state.population_groups[origin_group_id].population -= migrants;
 

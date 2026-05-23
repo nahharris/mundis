@@ -203,6 +203,75 @@ fn food_pressure_can_trigger_migration_and_found_a_neighbor_settlement() {
 }
 
 #[test]
+fn zero_migrant_split_prevents_migration() {
+    let config = SimulationConfig {
+        months: 2,
+        world: WorldSize { regions: 4 },
+        living_history: LivingHistoryConfig {
+            initial_settlements: 1,
+            initial_population_per_mille: 1_600,
+            monthly_growth_per_mille: 0,
+            migration_pressure_threshold_per_mille: 1_050,
+            decline_pressure_threshold_per_mille: 3_000,
+            migrant_split_per_mille: 0,
+        },
+        ..SimulationConfig::default()
+    };
+    let mut simulation = Simulation::new(config.clone(), SimulationSeed::from_u64(9));
+
+    let events = simulation.run_months(config.months);
+    let snapshot = simulation.snapshot();
+
+    assert!(
+        events
+            .iter()
+            .any(|event| event.event_type == EventType::FoodPressure)
+    );
+    assert!(
+        events
+            .iter()
+            .all(|event| event.event_type != EventType::Migration)
+    );
+    assert_eq!(snapshot.state.settlements.len(), 1);
+}
+
+#[test]
+fn migrant_split_above_total_population_is_clamped() {
+    let config = SimulationConfig {
+        months: 1,
+        world: WorldSize { regions: 4 },
+        living_history: LivingHistoryConfig {
+            initial_settlements: 1,
+            initial_population_per_mille: 1_600,
+            monthly_growth_per_mille: 0,
+            migration_pressure_threshold_per_mille: 1_050,
+            decline_pressure_threshold_per_mille: 3_000,
+            migrant_split_per_mille: 2_000,
+        },
+        ..SimulationConfig::default()
+    };
+    let mut simulation = Simulation::new(config.clone(), SimulationSeed::from_u64(9));
+    let initial_population = simulation.snapshot().state.total_population();
+
+    let events = simulation.run_months(config.months);
+    let snapshot = simulation.snapshot();
+
+    assert!(
+        events
+            .iter()
+            .any(|event| event.event_type == EventType::Migration)
+    );
+    assert_eq!(snapshot.state.total_population(), initial_population);
+    assert!(
+        snapshot
+            .state
+            .population_groups
+            .iter()
+            .all(|group| group.population <= initial_population)
+    );
+}
+
+#[test]
 fn trapped_food_pressure_can_decline_a_settlement() {
     let config = SimulationConfig {
         months: 2,
