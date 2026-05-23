@@ -3,7 +3,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
     config::{LivingHistoryConfig, SimulationConfig},
-    world::{RegionId, World},
+    world::{Biome, RegionId, Resource, World},
 };
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -43,6 +43,7 @@ pub type SettlementId = usize;
 pub enum SettlementStatus {
     Active,
     Declining,
+    Abandoned,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -57,7 +58,7 @@ pub struct PopulationGroup {
 
 pub type PopulationGroupId = usize;
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum SubsistenceMode {
     Foraging,
@@ -92,6 +93,8 @@ pub enum EventType {
     FoodPressure,
     Migration,
     SettlementDecline,
+    EnvironmentalStress,
+    SettlementAbandoned,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -134,6 +137,43 @@ impl SimulationState {
             .map(|group| group.population)
             .sum()
     }
+
+    pub fn effective_capacity(&self, region_id: RegionId, subsistence: SubsistenceMode) -> u64 {
+        let region = &self.world.regions[region_id];
+        let mut capacity = region.carrying_capacity as u64;
+
+        capacity = match subsistence {
+            SubsistenceMode::Farming => match region.biome {
+                Biome::Grassland => capacity * 120 / 100,
+                Biome::Forest | Biome::Rainforest => capacity * 90 / 100,
+                Biome::Tundra | Biome::Desert => capacity * 55 / 100,
+            },
+            SubsistenceMode::Foraging => match region.biome {
+                Biome::Forest | Biome::Rainforest => capacity * 105 / 100,
+                Biome::Tundra | Biome::Desert => capacity * 75 / 100,
+                Biome::Grassland => capacity * 85 / 100,
+            },
+            SubsistenceMode::Pastoral => match region.biome {
+                Biome::Grassland => capacity * 115 / 100,
+                Biome::Desert | Biome::Tundra => capacity * 80 / 100,
+                Biome::Forest | Biome::Rainforest => capacity * 70 / 100,
+            },
+        };
+
+        for resource in &region.resources {
+            capacity = match (subsistence, resource) {
+                (SubsistenceMode::Farming, Resource::Grain) => capacity * 125 / 100,
+                (SubsistenceMode::Foraging, Resource::Fish) => capacity * 120 / 100,
+                (SubsistenceMode::Pastoral, Resource::Horses) => capacity * 120 / 100,
+                (_, Resource::Salt) => capacity * 105 / 100,
+                (_, Resource::Timber) => capacity * 103 / 100,
+                (_, Resource::Copper) => capacity,
+                _ => capacity,
+            };
+        }
+
+        capacity.max(1)
+    }
 }
 
 impl Simulation {
@@ -163,13 +203,20 @@ impl Simulation {
 
         let initial_settlement_count = self.state.settlements.len();
         for settlement_id in 0..initial_settlement_count {
-            if self
+            let Some(status) = self
                 .state
                 .settlements
                 .get(settlement_id)
-                .is_some_and(|settlement| settlement.status == SettlementStatus::Active)
-            {
+                .map(|settlement| settlement.status.clone())
+            else {
+                continue;
+            };
+
+            if status == SettlementStatus::Active {
                 self.apply_growth(settlement_id, &mut events);
+            }
+            if status == SettlementStatus::Active || status == SettlementStatus::Declining {
+                self.apply_environmental_stress(settlement_id, &mut events);
                 self.apply_pressure(settlement_id, &mut events);
             }
         }
@@ -282,6 +329,54 @@ impl Simulation {
         } else if pressure >= decline_threshold as u64 {
             self.decline_settlement(settlement_id, pressure, events);
         }
+    }
+
+    fn apply_environmental_stress(
+        &mut self,
+        settlement_id: SettlementId,
+        events: &mut Vec<SimulationEvent>,
+    ) {
+        if self.state.month % 6 != 0 {
+            return;
+        }
+
+        let settlement = self.state.settlements[settlement_id].clone();
+        let region = &self.state.world.regions[settlement.region];
+        let Some(group) = self
+            .state
+            .population_groups
+            .iter()
+            .find(|group| group.settlement == Some(settlement_id))
+            .cloned()
+        else {
+            return;
+        };
+        let stress = stress_for(&region.biome, &group.subsistence);
+
+        self.state.settlements[settlement_id].stability -= stress;
+        events.push(self.make_event(
+            EventType::EnvironmentalStress,
+            EventSeverity::Important,
+            vec![
+                "environment".to_string(),
+                "stress".to_string(),
+                "settlement".to_string(),
+            ],
+            vec![
+                EventSubject::Settlement(settlement.id),
+                EventSubject::PopulationGroup(group.id),
+                EventSubject::Region(settlement.region),
+            ],
+            vec![format!(
+                "seasonal stress strained {:?} subsistence in {:?}",
+                group.subsistence, region.biome
+            )],
+            vec![format!("{} lost {stress} stability", settlement.name)],
+            format!(
+                "Seasonal stress in {} strained {} and weakened local stability.",
+                region.name, settlement.name
+            ),
+        ));
     }
 
     fn migrate_to_region(
@@ -405,11 +500,80 @@ impl Simulation {
                 settlement.name
             ),
         ));
+
+        if settlement.stability <= 0 {
+            self.abandon_settlement(settlement_id, events);
+        }
+    }
+
+    fn abandon_settlement(
+        &mut self,
+        settlement_id: SettlementId,
+        events: &mut Vec<SimulationEvent>,
+    ) {
+        let settlement = &mut self.state.settlements[settlement_id];
+        settlement.status = SettlementStatus::Abandoned;
+        settlement.stability = 0;
+        let settlement = settlement.clone();
+
+        let group_ids: Vec<PopulationGroupId> = self
+            .state
+            .population_groups
+            .iter()
+            .filter(|group| group.settlement == Some(settlement_id))
+            .map(|group| group.id)
+            .collect();
+        let mut population_loss = 0;
+        for group_id in group_ids {
+            let group = &mut self.state.population_groups[group_id];
+            let loss = group.population / 2;
+            population_loss += loss;
+            group.population -= loss;
+            group.settlement = None;
+        }
+
+        events.push(self.make_event(
+            EventType::SettlementAbandoned,
+            EventSeverity::Important,
+            vec![
+                "settlement".to_string(),
+                "abandonment".to_string(),
+                "population-loss".to_string(),
+            ],
+            vec![
+                EventSubject::Settlement(settlement.id),
+                EventSubject::Region(settlement.region),
+            ],
+            vec![
+                "stability reached zero".to_string(),
+                "no open neighboring region could absorb migrants".to_string(),
+            ],
+            vec![
+                format!("{} was abandoned", settlement.name),
+                format!("population loss of {population_loss} people"),
+            ],
+            format!(
+                "{} was abandoned after sustained pressure caused a population loss of {population_loss} people.",
+                settlement.name
+            ),
+        ));
     }
 
     fn pressure_per_mille(&self, settlement_id: SettlementId) -> u64 {
         let settlement = &self.state.settlements[settlement_id];
-        let capacity = self.state.world.regions[settlement.region].carrying_capacity as u64;
+        let capacity = self
+            .state
+            .population_groups
+            .iter()
+            .filter(|group| group.settlement == Some(settlement_id))
+            .map(|group| {
+                self.state
+                    .effective_capacity(settlement.region, group.subsistence)
+            })
+            .max()
+            .unwrap_or_else(|| {
+                self.state.world.regions[settlement.region].carrying_capacity as u64
+            });
         if capacity == 0 {
             return u64::MAX;
         }
@@ -451,6 +615,15 @@ impl Simulation {
             consequences,
             summary,
         }
+    }
+}
+
+fn stress_for(biome: &Biome, subsistence: &SubsistenceMode) -> i32 {
+    match (biome, subsistence) {
+        (Biome::Desert | Biome::Tundra, SubsistenceMode::Farming) => 30,
+        (Biome::Rainforest, SubsistenceMode::Pastoral) => 20,
+        (Biome::Desert, SubsistenceMode::Foraging) => 15,
+        _ => 5,
     }
 }
 
