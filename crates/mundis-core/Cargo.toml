@@ -15,4 +15,9 @@ serde_json.workspace = true
 toml.workspace = true
 
 [dev-dependencies]
+criterion.workspace = true
 tempfile.workspace = true
+
+[[bench]]
+name = "simulation_benchmarks"
+harness = false

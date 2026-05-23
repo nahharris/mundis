@@ -11,6 +11,7 @@ repository = "https://github.com/nahharris/mundis"
 anyhow = "1.0"
 bincode = { version = "2.0", features = ["serde"] }
 clap = { version = "4.5", features = ["derive"] }
+criterion = "0.8.2"
 rand = "0.9"
 rand_chacha = "0.9"
 rusqlite = { version = "0.37", features = ["bundled"] }
