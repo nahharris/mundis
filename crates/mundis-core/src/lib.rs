@@ -1,3 +1,4 @@
+pub mod civilization;
 pub mod config;
 pub mod export;
 pub mod simulation;

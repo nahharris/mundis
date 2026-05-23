@@ -2,6 +2,10 @@ use rand_chacha::{ChaCha8Rng, rand_core::SeedableRng};
 use serde::{Deserialize, Serialize};
 
 use crate::{
+    civilization::{
+        Culture, CultureId, CultureTrait, Polity, PolityId, PolityStatus, Rivalry, RivalryId,
+        TradeLink,
+    },
     config::{LivingHistoryConfig, SimulationConfig},
     world::{Biome, RegionId, Resource, World},
 };
@@ -23,6 +27,10 @@ pub struct SimulationState {
     pub population: u64,
     pub settlements: Vec<Settlement>,
     pub population_groups: Vec<PopulationGroup>,
+    pub cultures: Vec<Culture>,
+    pub polities: Vec<Polity>,
+    pub trade_links: Vec<TradeLink>,
+    pub rivalries: Vec<Rivalry>,
     pub event_count: u64,
 }
 
@@ -34,6 +42,7 @@ pub struct Settlement {
     pub founded_month: u32,
     pub status: SettlementStatus,
     pub stability: i32,
+    pub polity: Option<PolityId>,
 }
 
 pub type SettlementId = usize;
@@ -54,6 +63,7 @@ pub struct PopulationGroup {
     pub settlement: Option<SettlementId>,
     pub population: u64,
     pub subsistence: SubsistenceMode,
+    pub culture: Option<CultureId>,
 }
 
 pub type PopulationGroupId = usize;
@@ -95,6 +105,12 @@ pub enum EventType {
     SettlementDecline,
     EnvironmentalStress,
     SettlementAbandoned,
+    PolityFounded,
+    PolityExpanded,
+    TradeLinkFormed,
+    BorderTension,
+    CultureDrift,
+    PolityCollapse,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -103,6 +119,8 @@ pub enum EventSubject {
     Region(RegionId),
     Settlement(SettlementId),
     PopulationGroup(PopulationGroupId),
+    Culture(CultureId),
+    Polity(PolityId),
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -179,7 +197,7 @@ impl SimulationState {
 impl Simulation {
     pub fn new(config: SimulationConfig, seed: SimulationSeed) -> Self {
         let world = World::generate(&config, seed);
-        let (settlements, population_groups) = initialize_living_history(&world, &config);
+        let (settlements, population_groups, cultures) = initialize_living_history(&world, &config);
         let population = population_groups.iter().map(|group| group.population).sum();
 
         Self {
@@ -191,6 +209,10 @@ impl Simulation {
                 population,
                 settlements,
                 population_groups,
+                cultures,
+                polities: Vec::new(),
+                trade_links: Vec::new(),
+                rivalries: Vec::new(),
                 event_count: 0,
             },
         }
@@ -221,6 +243,10 @@ impl Simulation {
             }
         }
 
+        if self.config.civilization.enabled {
+            self.apply_civilization(&mut events);
+        }
+
         if events.is_empty() {
             events.push(self.make_event(
                 EventType::SettlementGrowth,
@@ -247,6 +273,439 @@ impl Simulation {
             seed: self.seed,
             state: self.state.clone(),
         }
+    }
+
+    fn apply_civilization(&mut self, events: &mut Vec<SimulationEvent>) {
+        self.found_polities(events);
+        self.expand_polities(events);
+        self.form_trade_links(events);
+        self.apply_border_tension(events);
+        self.apply_cultural_drift(events);
+        self.collapse_unstable_polities(events);
+    }
+
+    fn found_polities(&mut self, events: &mut Vec<SimulationEvent>) {
+        let threshold = self.config.civilization.polity_foundation_population;
+        let candidates: Vec<SettlementId> = self
+            .state
+            .settlements
+            .iter()
+            .filter(|settlement| {
+                settlement.status == SettlementStatus::Active && settlement.polity.is_none()
+            })
+            .filter(|settlement| !self.settlement_has_polity_history(settlement.id))
+            .filter(|settlement| self.state.settlement_population(settlement.id) >= threshold)
+            .map(|settlement| settlement.id)
+            .collect();
+
+        for settlement_id in candidates {
+            let Some(culture_id) = self.primary_culture_for_settlement(settlement_id) else {
+                continue;
+            };
+            let polity_id = self.state.polities.len();
+            let settlement = self.state.settlements[settlement_id].clone();
+            self.state.settlements[settlement_id].polity = Some(polity_id);
+            self.state.polities.push(Polity {
+                id: polity_id,
+                name: format!("{} Compact", settlement.name),
+                status: PolityStatus::Active,
+                primary_culture: culture_id,
+                capital: settlement_id,
+                controlled_settlements: vec![settlement_id],
+                controlled_regions: vec![settlement.region],
+                cohesion: 100,
+            });
+            events.push(self.make_event(
+                EventType::PolityFounded,
+                EventSeverity::Important,
+                vec!["polity".to_string(), "institution".to_string()],
+                vec![
+                    EventSubject::Polity(polity_id),
+                    EventSubject::Settlement(settlement_id),
+                    EventSubject::Culture(culture_id),
+                    EventSubject::Region(settlement.region),
+                ],
+                vec![format!(
+                    "{} reached {} people",
+                    settlement.name,
+                    self.state.settlement_population(settlement_id)
+                )],
+                vec![format!(
+                    "{} formed around {}",
+                    self.state.polities[polity_id].name, settlement.name
+                )],
+                format!(
+                    "{} formed as households in {} accepted shared institutions.",
+                    self.state.polities[polity_id].name, settlement.name
+                ),
+            ));
+        }
+    }
+
+    fn expand_polities(&mut self, events: &mut Vec<SimulationEvent>) {
+        let threshold = self
+            .config
+            .civilization
+            .expansion_pressure_threshold_per_mille as u64;
+        let mut expansions = Vec::new();
+        for polity in self
+            .state
+            .polities
+            .iter()
+            .filter(|polity| polity.status == PolityStatus::Active)
+        {
+            for settlement in self.state.settlements.iter().filter(|settlement| {
+                settlement.status == SettlementStatus::Active && settlement.polity.is_none()
+            }) {
+                let borders = polity.controlled_regions.iter().any(|region| {
+                    self.state.world.regions[*region]
+                        .neighbors
+                        .contains(&settlement.region)
+                });
+                if borders
+                    && self.pressure_per_mille(polity.capital) >= threshold
+                    && self.primary_culture_for_settlement(settlement.id)
+                        == Some(polity.primary_culture)
+                {
+                    expansions.push((polity.id, settlement.id));
+                }
+            }
+        }
+
+        for (polity_id, settlement_id) in expansions {
+            if self.state.settlements[settlement_id].polity.is_some()
+                || self.state.polities[polity_id].status != PolityStatus::Active
+            {
+                continue;
+            }
+            self.state.settlements[settlement_id].polity = Some(polity_id);
+            let region = self.state.settlements[settlement_id].region;
+            let polity = &mut self.state.polities[polity_id];
+            polity.controlled_settlements.push(settlement_id);
+            if !polity.controlled_regions.contains(&region) {
+                polity.controlled_regions.push(region);
+                polity.controlled_regions.sort_unstable();
+            }
+            let polity_name = polity.name.clone();
+            let settlement_name = self.state.settlements[settlement_id].name.clone();
+            events.push(self.make_event(
+                EventType::PolityExpanded,
+                EventSeverity::Important,
+                vec!["polity".to_string(), "border".to_string()],
+                vec![
+                    EventSubject::Polity(polity_id),
+                    EventSubject::Settlement(settlement_id),
+                    EventSubject::Region(region),
+                ],
+                vec!["neighboring settlement shared culture and pressure".to_string()],
+                vec![format!("{polity_name} claimed {settlement_name}")],
+                format!("{polity_name} expanded its institutions into {settlement_name}."),
+            ));
+        }
+    }
+
+    fn form_trade_links(&mut self, events: &mut Vec<SimulationEvent>) {
+        let interval = self.config.civilization.trade_interval_months.max(1);
+        if self.state.month % interval != 0 {
+            return;
+        }
+        for (left, right) in self.neighboring_active_polity_pairs() {
+            if self.trade_link_exists(left, right) {
+                continue;
+            }
+            let resources = self.complementary_resources(left, right);
+            if resources.is_empty() {
+                continue;
+            }
+            let id = self.state.trade_links.len();
+            self.state.trade_links.push(TradeLink {
+                id,
+                polities: ordered_pair(left, right),
+                resources: resources.clone(),
+                strength: 25,
+                founded_month: self.state.month,
+            });
+            events.push(self.make_event(
+                EventType::TradeLinkFormed,
+                EventSeverity::Important,
+                vec!["trade".to_string(), "polity".to_string()],
+                vec![EventSubject::Polity(left), EventSubject::Polity(right)],
+                vec!["neighboring polities held complementary resources".to_string()],
+                vec![format!("trade linked resources {:?}", resources)],
+                format!(
+                    "{} and {} opened a trade link.",
+                    self.state.polities[left].name, self.state.polities[right].name
+                ),
+            ));
+        }
+    }
+
+    fn apply_border_tension(&mut self, events: &mut Vec<SimulationEvent>) {
+        let interval = self.config.civilization.tension_interval_months.max(1);
+        if self.state.month % interval != 0 {
+            return;
+        }
+        for (left, right) in self.neighboring_active_polity_pairs() {
+            let Some(left_region) = self.representative_region(left) else {
+                continue;
+            };
+            let Some(right_region) = self.representative_region(right) else {
+                continue;
+            };
+            let pressure = self.pressure_per_mille(self.state.polities[left].capital)
+                + self.pressure_per_mille(self.state.polities[right].capital);
+            if pressure < 2_000 && self.trade_link_exists(left, right) {
+                continue;
+            }
+            let rivalry_id = self.record_rivalry(left, right, 15);
+            self.state.polities[left].cohesion -= 10;
+            self.state.polities[right].cohesion -= 10;
+            events.push(self.make_event(
+                EventType::BorderTension,
+                EventSeverity::Important,
+                vec![
+                    "border".to_string(),
+                    "tension".to_string(),
+                    "polity".to_string(),
+                ],
+                vec![
+                    EventSubject::Polity(left),
+                    EventSubject::Polity(right),
+                    EventSubject::Region(left_region),
+                    EventSubject::Region(right_region),
+                ],
+                vec![format!(
+                    "border pressure reached {pressure} combined per mille"
+                )],
+                vec![format!("rivalry {rivalry_id} intensified")],
+                format!(
+                    "Border tension rose between {} and {}.",
+                    self.state.polities[left].name, self.state.polities[right].name
+                ),
+            ));
+        }
+    }
+
+    fn apply_cultural_drift(&mut self, events: &mut Vec<SimulationEvent>) {
+        let interval = self
+            .config
+            .civilization
+            .cultural_drift_interval_months
+            .max(1);
+        if self.state.month % interval != 0 {
+            return;
+        }
+        for culture_id in 0..self.state.cultures.len() {
+            let mut regions: Vec<RegionId> = self
+                .state
+                .population_groups
+                .iter()
+                .filter(|group| group.culture == Some(culture_id))
+                .map(|group| group.region)
+                .collect();
+            regions.sort_unstable();
+            regions.dedup();
+            if regions.len() < 2 {
+                continue;
+            }
+            self.state.cultures[culture_id].drift += regions.len() as i32;
+            let culture_name = self.state.cultures[culture_id].name.clone();
+            events.push(self.make_event(
+                EventType::CultureDrift,
+                EventSeverity::Important,
+                vec!["culture".to_string(), "drift".to_string()],
+                vec![EventSubject::Culture(culture_id)],
+                vec![format!("culture spanned {} regions", regions.len())],
+                vec![format!("{culture_name} drift increased")],
+                format!("{culture_name} changed as its households spread between regions."),
+            ));
+        }
+    }
+
+    fn collapse_unstable_polities(&mut self, events: &mut Vec<SimulationEvent>) {
+        let threshold = self.config.civilization.collapse_cohesion_threshold;
+        let candidates: Vec<PolityId> = self
+            .state
+            .polities
+            .iter()
+            .filter(|polity| polity.status == PolityStatus::Active && polity.cohesion <= threshold)
+            .map(|polity| polity.id)
+            .collect();
+        for polity_id in candidates {
+            let controlled = self.state.polities[polity_id]
+                .controlled_settlements
+                .clone();
+            for settlement_id in controlled {
+                if self.state.settlements[settlement_id].polity == Some(polity_id) {
+                    self.state.settlements[settlement_id].polity = None;
+                }
+            }
+            self.state.polities[polity_id].status = PolityStatus::Collapsed;
+            let polity_name = self.state.polities[polity_id].name.clone();
+            events.push(self.make_event(
+                EventType::PolityCollapse,
+                EventSeverity::Important,
+                vec!["polity".to_string(), "collapse".to_string()],
+                vec![EventSubject::Polity(polity_id)],
+                vec![format!(
+                    "cohesion fell to {}",
+                    self.state.polities[polity_id].cohesion
+                )],
+                vec![format!("{polity_name} released its settlements")],
+                format!("{polity_name} collapsed after its cohesion failed."),
+            ));
+        }
+    }
+
+    fn primary_culture_for_settlement(&self, settlement_id: SettlementId) -> Option<CultureId> {
+        self.state
+            .population_groups
+            .iter()
+            .find(|group| group.settlement == Some(settlement_id))
+            .and_then(|group| group.culture)
+    }
+
+    fn settlement_has_polity_history(&self, settlement_id: SettlementId) -> bool {
+        self.state
+            .polities
+            .iter()
+            .any(|polity| polity.controlled_settlements.contains(&settlement_id))
+    }
+
+    fn representative_region(&self, polity_id: PolityId) -> Option<RegionId> {
+        self.state.polities[polity_id]
+            .controlled_regions
+            .first()
+            .copied()
+            .or_else(|| {
+                self.state.polities[polity_id]
+                    .controlled_settlements
+                    .first()
+                    .map(|settlement_id| self.state.settlements[*settlement_id].region)
+            })
+    }
+
+    fn sync_polity_holdings_after_settlement_loss(&mut self, polity_id: PolityId) {
+        let controlled_settlements = self.state.polities[polity_id]
+            .controlled_settlements
+            .iter()
+            .copied()
+            .filter(|settlement_id| {
+                self.state
+                    .settlements
+                    .get(*settlement_id)
+                    .is_some_and(|settlement| {
+                        settlement.polity == Some(polity_id)
+                            && settlement.status != SettlementStatus::Abandoned
+                    })
+            })
+            .collect::<Vec<_>>();
+
+        let mut controlled_regions = controlled_settlements
+            .iter()
+            .map(|settlement_id| self.state.settlements[*settlement_id].region)
+            .collect::<Vec<_>>();
+        controlled_regions.sort_unstable();
+        controlled_regions.dedup();
+
+        let polity = &mut self.state.polities[polity_id];
+        polity.controlled_settlements = controlled_settlements;
+        polity.controlled_regions = controlled_regions;
+        if polity.controlled_settlements.is_empty() {
+            polity.status = PolityStatus::Collapsed;
+        }
+    }
+
+    fn neighboring_active_polity_pairs(&self) -> Vec<(PolityId, PolityId)> {
+        let mut pairs = Vec::new();
+        for left in self
+            .state
+            .polities
+            .iter()
+            .filter(|polity| polity.status == PolityStatus::Active)
+        {
+            for right in self
+                .state
+                .polities
+                .iter()
+                .filter(|polity| polity.status == PolityStatus::Active && polity.id > left.id)
+            {
+                let neighbors = left.controlled_regions.iter().any(|left_region| {
+                    right.controlled_regions.iter().any(|right_region| {
+                        self.state.world.regions[*left_region]
+                            .neighbors
+                            .contains(right_region)
+                    })
+                });
+                if neighbors {
+                    pairs.push((left.id, right.id));
+                }
+            }
+        }
+        pairs
+    }
+
+    fn trade_link_exists(&self, left: PolityId, right: PolityId) -> bool {
+        let pair = ordered_pair(left, right);
+        self.state
+            .trade_links
+            .iter()
+            .any(|link| link.polities == pair)
+    }
+
+    fn complementary_resources(&self, left: PolityId, right: PolityId) -> Vec<Resource> {
+        let left_resources = self.resources_for_polity(left);
+        let right_resources = self.resources_for_polity(right);
+        let mut resources: Vec<Resource> = left_resources
+            .iter()
+            .filter(|resource| !right_resources.contains(resource))
+            .chain(
+                right_resources
+                    .iter()
+                    .filter(|resource| !left_resources.contains(resource)),
+            )
+            .cloned()
+            .collect();
+        resources.sort_by_key(|resource| format!("{resource:?}"));
+        resources.dedup();
+        resources
+    }
+
+    fn resources_for_polity(&self, polity_id: PolityId) -> Vec<Resource> {
+        let mut resources = Vec::new();
+        for region_id in &self.state.polities[polity_id].controlled_regions {
+            resources.extend(
+                self.state.world.regions[*region_id]
+                    .resources
+                    .iter()
+                    .cloned(),
+            );
+        }
+        resources.sort_by_key(|resource| format!("{resource:?}"));
+        resources.dedup();
+        resources
+    }
+
+    fn record_rivalry(&mut self, left: PolityId, right: PolityId, added_tension: i32) -> RivalryId {
+        let pair = ordered_pair(left, right);
+        if let Some(rivalry) = self
+            .state
+            .rivalries
+            .iter_mut()
+            .find(|rivalry| rivalry.polities == pair)
+        {
+            rivalry.tension += added_tension;
+            return rivalry.id;
+        }
+
+        let id = self.state.rivalries.len();
+        self.state.rivalries.push(Rivalry {
+            id,
+            polities: pair,
+            tension: added_tension,
+            started_month: self.state.month,
+        });
+        id
     }
 
     fn apply_growth(&mut self, settlement_id: SettlementId, events: &mut Vec<SimulationEvent>) {
@@ -417,6 +876,7 @@ impl Simulation {
             founded_month: self.state.month,
             status: SettlementStatus::Active,
             stability: 100,
+            polity: None,
         });
 
         let group_id = self.state.population_groups.len();
@@ -427,6 +887,7 @@ impl Simulation {
             settlement: Some(settlement_id),
             population: migrants,
             subsistence: SubsistenceMode::Farming,
+            culture: self.state.population_groups[origin_group_id].culture,
         });
 
         events.push(self.make_event(
@@ -514,7 +975,14 @@ impl Simulation {
         let settlement = &mut self.state.settlements[settlement_id];
         settlement.status = SettlementStatus::Abandoned;
         settlement.stability = 0;
+        let polity_id = settlement.polity.take();
         let settlement = settlement.clone();
+
+        if let Some(polity_id) = polity_id {
+            self.sync_polity_holdings_after_settlement_loss(polity_id);
+            let polity = &mut self.state.polities[polity_id];
+            polity.cohesion -= 20;
+        }
 
         let group_ids: Vec<PopulationGroupId> = self
             .state
@@ -630,11 +1098,12 @@ fn stress_for(biome: &Biome, subsistence: &SubsistenceMode) -> i32 {
 fn initialize_living_history(
     world: &World,
     config: &SimulationConfig,
-) -> (Vec<Settlement>, Vec<PopulationGroup>) {
+) -> (Vec<Settlement>, Vec<PopulationGroup>, Vec<Culture>) {
     let settings = &config.living_history;
     let settlement_count = settings.initial_settlements.max(1).min(world.regions.len());
     let mut settlements = Vec::with_capacity(settlement_count);
     let mut population_groups = Vec::with_capacity(settlement_count);
+    let mut cultures = Vec::with_capacity(settlement_count);
 
     for region in world.regions.iter().take(settlement_count) {
         let settlement_id = settlements.len();
@@ -646,6 +1115,7 @@ fn initialize_living_history(
             founded_month: 0,
             status: SettlementStatus::Active,
             stability: 100,
+            polity: None,
         });
         population_groups.push(PopulationGroup {
             id: settlement_id,
@@ -654,10 +1124,47 @@ fn initialize_living_history(
             settlement: Some(settlement_id),
             population,
             subsistence: SubsistenceMode::Farming,
+            culture: config.civilization.enabled.then_some(settlement_id),
         });
+        if config.civilization.enabled {
+            cultures.push(Culture {
+                id: settlement_id,
+                name: format!("{} Folk", region.name),
+                origin_region: region.id,
+                traits: traits_for(region),
+                drift: 0,
+            });
+        }
     }
 
-    (settlements, population_groups)
+    (settlements, population_groups, cultures)
+}
+
+fn ordered_pair(left: PolityId, right: PolityId) -> (PolityId, PolityId) {
+    if left < right {
+        (left, right)
+    } else {
+        (right, left)
+    }
+}
+
+fn traits_for(region: &crate::world::Region) -> Vec<CultureTrait> {
+    let biome_trait = match region.biome {
+        Biome::Tundra => CultureTrait::Highland,
+        Biome::Forest | Biome::Rainforest => CultureTrait::Forest,
+        Biome::Grassland => CultureTrait::Steppe,
+        Biome::Desert => CultureTrait::Mercantile,
+    };
+    let resource_trait = if region.resources.contains(&Resource::Fish) {
+        CultureTrait::Maritime
+    } else if region.resources.contains(&Resource::Salt)
+        || region.resources.contains(&Resource::Copper)
+    {
+        CultureTrait::Mercantile
+    } else {
+        CultureTrait::Riverine
+    };
+    vec![biome_trait, resource_trait]
 }
 
 fn initial_population(carrying_capacity: u32, settings: &LivingHistoryConfig) -> u64 {
