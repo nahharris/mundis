@@ -1,7 +1,10 @@
 use mundis_core::{
-    config::{SimulationBias, SimulationConfig, WorldSize},
+    config::{LivingHistoryConfig, SimulationBias, SimulationConfig, WorldSize},
     export::{render_json, render_markdown, render_text},
-    simulation::{EventSeverity, Simulation, SimulationEvent, SimulationSeed},
+    simulation::{
+        EventSeverity, EventSubject, EventType, SettlementStatus, Simulation, SimulationEvent,
+        SimulationSeed,
+    },
     storage::SaveDatabase,
     world::World,
 };
@@ -65,16 +68,178 @@ fn simulation_events_reference_valid_months_and_snapshot_state() {
     let events = simulation.run_months(config.months);
     let snapshot = simulation.snapshot();
 
-    assert_eq!(events.len(), config.months as usize);
+    assert!(events.len() >= config.months as usize);
     for (index, event) in events.iter().enumerate() {
         assert_eq!(event.id, index as u64 + 1);
-        assert_eq!(event.month, index as u32 + 1);
+        assert!((1..=config.months).contains(&event.month));
         assert!(!event.tags.is_empty());
         assert!(!event.summary.is_empty());
     }
     assert_eq!(snapshot.state.month, config.months);
-    assert_eq!(snapshot.state.event_count, config.months as u64);
     assert!(snapshot.state.world.is_connected());
+    assert_eq!(snapshot.state.event_count, events.len() as u64);
+}
+
+#[test]
+fn generated_world_region_names_are_unique_for_readable_chronicles() {
+    let config = SimulationConfig {
+        world: WorldSize { regions: 4 },
+        ..SimulationConfig::default()
+    };
+
+    let world = World::generate(&config, SimulationSeed::from_u64(9));
+    let names = world
+        .regions
+        .iter()
+        .map(|region| region.name.as_str())
+        .collect::<std::collections::HashSet<_>>();
+
+    assert_eq!(names.len(), world.regions.len());
+}
+
+#[test]
+fn simulation_initializes_deterministic_settlements_and_population_groups() {
+    let config = SimulationConfig {
+        world: WorldSize { regions: 6 },
+        living_history: LivingHistoryConfig {
+            initial_settlements: 2,
+            initial_population_per_mille: 250,
+            ..LivingHistoryConfig::default()
+        },
+        ..SimulationConfig::default()
+    };
+    let first = Simulation::new(config.clone(), SimulationSeed::from_u64(42));
+    let second = Simulation::new(config, SimulationSeed::from_u64(42));
+
+    let snapshot = first.snapshot();
+
+    assert_eq!(snapshot, second.snapshot());
+    assert_eq!(snapshot.state.settlements.len(), 2);
+    assert_eq!(snapshot.state.population_groups.len(), 2);
+    assert_eq!(
+        snapshot.state.total_population(),
+        snapshot
+            .state
+            .population_groups
+            .iter()
+            .map(|group| group.population)
+            .sum::<u64>()
+    );
+    for settlement in &snapshot.state.settlements {
+        assert_eq!(settlement.status, SettlementStatus::Active);
+        assert!(
+            snapshot
+                .state
+                .world
+                .regions
+                .iter()
+                .any(|region| region.id == settlement.region)
+        );
+    }
+}
+
+#[test]
+fn food_pressure_can_trigger_migration_and_found_a_neighbor_settlement() {
+    let config = SimulationConfig {
+        months: 3,
+        world: WorldSize { regions: 4 },
+        living_history: LivingHistoryConfig {
+            initial_settlements: 1,
+            initial_population_per_mille: 1_600,
+            monthly_growth_per_mille: 25,
+            migration_pressure_threshold_per_mille: 1_050,
+            decline_pressure_threshold_per_mille: 3_000,
+            migrant_split_per_mille: 250,
+        },
+        ..SimulationConfig::default()
+    };
+    let mut simulation = Simulation::new(config.clone(), SimulationSeed::from_u64(9));
+
+    let events = simulation.run_months(config.months);
+    let snapshot = simulation.snapshot();
+
+    assert!(
+        events
+            .iter()
+            .any(|event| event.event_type == EventType::FoodPressure)
+    );
+    let migration = events
+        .iter()
+        .find(|event| event.event_type == EventType::Migration)
+        .expect("migration event");
+    let founded = events
+        .iter()
+        .find(|event| event.event_type == EventType::SettlementFounded)
+        .expect("settlement founding event");
+
+    assert!(
+        migration
+            .causes
+            .iter()
+            .any(|cause| cause.contains("food pressure"))
+    );
+    assert!(
+        migration
+            .subjects
+            .iter()
+            .any(|subject| matches!(subject, EventSubject::PopulationGroup(_)))
+    );
+    assert!(
+        founded
+            .subjects
+            .iter()
+            .any(|subject| matches!(subject, EventSubject::Settlement(_)))
+    );
+    assert!(snapshot.state.settlements.len() > 1);
+    assert_eq!(
+        snapshot.state.total_population(),
+        snapshot
+            .state
+            .population_groups
+            .iter()
+            .map(|group| group.population)
+            .sum::<u64>()
+    );
+}
+
+#[test]
+fn trapped_food_pressure_can_decline_a_settlement() {
+    let config = SimulationConfig {
+        months: 2,
+        world: WorldSize { regions: 2 },
+        living_history: LivingHistoryConfig {
+            initial_settlements: 2,
+            initial_population_per_mille: 2_400,
+            monthly_growth_per_mille: 0,
+            migration_pressure_threshold_per_mille: 1_050,
+            decline_pressure_threshold_per_mille: 1_250,
+            migrant_split_per_mille: 250,
+        },
+        ..SimulationConfig::default()
+    };
+    let mut simulation = Simulation::new(config.clone(), SimulationSeed::from_u64(5));
+
+    let events = simulation.run_months(config.months);
+    let snapshot = simulation.snapshot();
+
+    let decline = events
+        .iter()
+        .find(|event| event.event_type == EventType::SettlementDecline)
+        .expect("settlement decline event");
+
+    assert!(
+        decline
+            .causes
+            .iter()
+            .any(|cause| cause.contains("no open neighboring region"))
+    );
+    assert!(
+        snapshot
+            .state
+            .settlements
+            .iter()
+            .any(|settlement| settlement.status == SettlementStatus::Declining)
+    );
 }
 
 #[test]
@@ -112,15 +277,23 @@ fn text_json_and_markdown_exports_are_stable_renderers() {
         SimulationEvent {
             id: 1,
             month: 1,
+            event_type: EventType::SettlementGrowth,
             severity: EventSeverity::Note,
             tags: vec!["population".to_string()],
+            subjects: vec![EventSubject::Region(0)],
+            causes: vec!["seeded test".to_string()],
+            consequences: vec!["terraces filled".to_string()],
             summary: "Aruven stirred as terraces filled.".to_string(),
         },
         SimulationEvent {
             id: 2,
             month: 12,
+            event_type: EventType::FoodPressure,
             severity: EventSeverity::Important,
             tags: vec!["region".to_string(), "politics".to_string()],
+            subjects: vec![EventSubject::Region(1)],
+            causes: vec!["border pressure".to_string()],
+            consequences: vec!["customs changed".to_string()],
             summary: "Beltor reshaped its border customs.".to_string(),
         },
     ];
@@ -135,7 +308,7 @@ fn text_json_and_markdown_exports_are_stable_renderers() {
     );
     assert_eq!(
         render_json(&events).expect("JSON renders"),
-        "[\n  {\n    \"id\": 1,\n    \"month\": 1,\n    \"severity\": \"note\",\n    \"tags\": [\n      \"population\"\n    ],\n    \"summary\": \"Aruven stirred as terraces filled.\"\n  },\n  {\n    \"id\": 2,\n    \"month\": 12,\n    \"severity\": \"important\",\n    \"tags\": [\n      \"region\",\n      \"politics\"\n    ],\n    \"summary\": \"Beltor reshaped its border customs.\"\n  }\n]"
+        "[\n  {\n    \"id\": 1,\n    \"month\": 1,\n    \"event_type\": \"settlement-growth\",\n    \"severity\": \"note\",\n    \"tags\": [\n      \"population\"\n    ],\n    \"subjects\": [\n      {\n        \"region\": 0\n      }\n    ],\n    \"causes\": [\n      \"seeded test\"\n    ],\n    \"consequences\": [\n      \"terraces filled\"\n    ],\n    \"summary\": \"Aruven stirred as terraces filled.\"\n  },\n  {\n    \"id\": 2,\n    \"month\": 12,\n    \"event_type\": \"food-pressure\",\n    \"severity\": \"important\",\n    \"tags\": [\n      \"region\",\n      \"politics\"\n    ],\n    \"subjects\": [\n      {\n        \"region\": 1\n      }\n    ],\n    \"causes\": [\n      \"border pressure\"\n    ],\n    \"consequences\": [\n      \"customs changed\"\n    ],\n    \"summary\": \"Beltor reshaped its border customs.\"\n  }\n]"
     );
 }
 
@@ -144,8 +317,12 @@ fn markdown_handles_zero_month_events_without_underflowing() {
     let events = vec![SimulationEvent {
         id: 1,
         month: 0,
+        event_type: EventType::SettlementGrowth,
         severity: EventSeverity::Note,
         tags: vec!["malformed".to_string()],
+        subjects: vec![],
+        causes: vec![],
+        consequences: vec![],
         summary: "A malformed event still renders safely.".to_string(),
     }];
 
