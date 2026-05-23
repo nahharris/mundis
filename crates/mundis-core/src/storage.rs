@@ -7,7 +7,7 @@ use crate::{
     simulation::{SimulationEvent, SimulationSeed, SimulationSnapshot},
 };
 
-const SCHEMA_VERSION: i64 = 3;
+const SCHEMA_VERSION: i64 = 4;
 
 pub type StorageResult<T> = Result<T, Box<dyn Error + Send + Sync>>;
 
