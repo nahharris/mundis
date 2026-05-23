@@ -1,3 +1,5 @@
+use std::collections::HashMap;
+
 use rand::{Rng, seq::IndexedRandom};
 use rand_chacha::ChaCha8Rng;
 use serde::{Deserialize, Serialize};
@@ -60,6 +62,7 @@ impl World {
         let count = config.world.regions.max(2);
         let mut rng = seeded_rng(seed, 0xA11C_E000);
         let mut regions = Vec::with_capacity(count);
+        let mut name_counts = HashMap::new();
 
         for index in 0..count {
             let climate = random_climate(&mut rng);
@@ -80,7 +83,7 @@ impl World {
 
             regions.push(Region {
                 id: index,
-                name: generate_name(&mut rng),
+                name: unique_name(generate_name(&mut rng), &mut name_counts),
                 carrying_capacity: carrying_capacity(&biome, &mut rng),
                 resources: resources_for(&biome, &mut rng),
                 climate,
@@ -187,4 +190,15 @@ fn generate_name(rng: &mut ChaCha8Rng) -> String {
         STARTS.choose(rng).expect("starts"),
         ENDS.choose(rng).expect("ends")
     )
+}
+
+fn unique_name(base: String, name_counts: &mut HashMap<String, usize>) -> String {
+    let count = name_counts.entry(base.clone()).or_insert(0);
+    *count += 1;
+
+    if *count == 1 {
+        base
+    } else {
+        format!("{base} {}", *count)
+    }
 }
