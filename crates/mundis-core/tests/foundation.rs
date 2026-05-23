@@ -3,10 +3,10 @@ use mundis_core::{
     export::{render_json, render_markdown, render_text},
     simulation::{
         EventSeverity, EventSubject, EventType, SettlementStatus, Simulation, SimulationEvent,
-        SimulationSeed,
+        SimulationSeed, SubsistenceMode,
     },
     storage::SaveDatabase,
-    world::World,
+    world::{Resource, World},
 };
 
 #[test]
@@ -309,6 +309,205 @@ fn trapped_food_pressure_can_decline_a_settlement() {
             .iter()
             .any(|settlement| settlement.status == SettlementStatus::Declining)
     );
+}
+
+#[test]
+fn subsistence_and_resources_shape_effective_capacity() {
+    let config = SimulationConfig {
+        world: WorldSize { regions: 8 },
+        ..SimulationConfig::default()
+    };
+    let simulation = Simulation::new(config, SimulationSeed::from_u64(7));
+    let snapshot = simulation.snapshot();
+    let grain_region = snapshot
+        .state
+        .world
+        .regions
+        .iter()
+        .find(|region| {
+            region
+                .resources
+                .iter()
+                .any(|resource| matches!(resource, Resource::Grain))
+        })
+        .expect("generated grain region");
+
+    let farming_capacity = snapshot
+        .state
+        .effective_capacity(grain_region.id, SubsistenceMode::Farming);
+    let foraging_capacity = snapshot
+        .state
+        .effective_capacity(grain_region.id, SubsistenceMode::Foraging);
+
+    assert!(farming_capacity > foraging_capacity);
+}
+
+#[test]
+fn environmental_stress_reduces_stability_and_emits_structured_event() {
+    let config = SimulationConfig {
+        months: 12,
+        world: WorldSize { regions: 3 },
+        living_history: LivingHistoryConfig {
+            initial_settlements: 1,
+            initial_population_per_mille: 700,
+            monthly_growth_per_mille: 0,
+            migration_pressure_threshold_per_mille: 3_000,
+            decline_pressure_threshold_per_mille: 4_000,
+            migrant_split_per_mille: 250,
+        },
+        ..SimulationConfig::default()
+    };
+    let mut simulation = Simulation::new(config.clone(), SimulationSeed::from_u64(3));
+    let starting_stability = simulation.snapshot().state.settlements[0].stability;
+
+    let events = simulation.run_months(config.months);
+    let snapshot = simulation.snapshot();
+    let stress = events
+        .iter()
+        .find(|event| event.event_type == EventType::EnvironmentalStress)
+        .expect("environmental stress event");
+
+    assert!(
+        stress
+            .causes
+            .iter()
+            .any(|cause| cause.contains("seasonal stress"))
+    );
+    assert!(
+        stress
+            .subjects
+            .iter()
+            .any(|subject| matches!(subject, EventSubject::Settlement(0)))
+    );
+    assert!(snapshot.state.settlements[0].stability < starting_stability);
+}
+
+#[test]
+fn sustained_pressure_can_abandon_a_settlement_with_population_loss() {
+    let config = SimulationConfig {
+        months: 6,
+        world: WorldSize { regions: 2 },
+        living_history: LivingHistoryConfig {
+            initial_settlements: 2,
+            initial_population_per_mille: 3_000,
+            monthly_growth_per_mille: 0,
+            migration_pressure_threshold_per_mille: 1_050,
+            decline_pressure_threshold_per_mille: 1_100,
+            migrant_split_per_mille: 250,
+        },
+        ..SimulationConfig::default()
+    };
+    let mut simulation = Simulation::new(config.clone(), SimulationSeed::from_u64(5));
+    let initial_population = simulation.snapshot().state.total_population();
+
+    let events = simulation.run_months(config.months);
+    let snapshot = simulation.snapshot();
+
+    let abandonment = events
+        .iter()
+        .find(|event| event.event_type == EventType::SettlementAbandoned)
+        .expect("settlement abandonment event");
+
+    assert!(
+        snapshot
+            .state
+            .settlements
+            .iter()
+            .any(|settlement| settlement.status == SettlementStatus::Abandoned)
+    );
+    assert!(snapshot.state.total_population() < initial_population);
+    assert!(
+        abandonment
+            .consequences
+            .iter()
+            .any(|consequence| consequence.contains("population loss"))
+    );
+}
+
+#[test]
+fn abandoned_settlements_stop_growth_and_pressure_handling() {
+    let config = SimulationConfig {
+        months: 8,
+        world: WorldSize { regions: 2 },
+        living_history: LivingHistoryConfig {
+            initial_settlements: 2,
+            initial_population_per_mille: 3_000,
+            monthly_growth_per_mille: 50,
+            migration_pressure_threshold_per_mille: 1_050,
+            decline_pressure_threshold_per_mille: 1_100,
+            migrant_split_per_mille: 250,
+        },
+        ..SimulationConfig::default()
+    };
+    let mut simulation = Simulation::new(config.clone(), SimulationSeed::from_u64(5));
+
+    let events = simulation.run_months(config.months);
+    let abandonment = events
+        .iter()
+        .find(|event| event.event_type == EventType::SettlementAbandoned)
+        .expect("settlement abandonment event");
+    let abandoned_id = abandonment
+        .subjects
+        .iter()
+        .find_map(|subject| match subject {
+            EventSubject::Settlement(id) => Some(*id),
+            _ => None,
+        })
+        .expect("abandoned settlement subject");
+
+    assert!(
+        events
+            .iter()
+            .filter(|event| event.month > abandonment.month)
+            .all(|event| !event
+                .subjects
+                .contains(&EventSubject::Settlement(abandoned_id)))
+    );
+}
+
+#[test]
+fn emitted_event_subjects_reference_existing_state_entities() {
+    let config = SimulationConfig {
+        months: 12,
+        world: WorldSize { regions: 4 },
+        living_history: LivingHistoryConfig {
+            initial_settlements: 1,
+            initial_population_per_mille: 1_600,
+            monthly_growth_per_mille: 25,
+            migration_pressure_threshold_per_mille: 1_050,
+            decline_pressure_threshold_per_mille: 3_000,
+            migrant_split_per_mille: 250,
+        },
+        ..SimulationConfig::default()
+    };
+    let mut simulation = Simulation::new(config.clone(), SimulationSeed::from_u64(9));
+
+    let events = simulation.run_months(config.months);
+    let snapshot = simulation.snapshot();
+
+    for event in &events {
+        for subject in &event.subjects {
+            match subject {
+                EventSubject::Region(id) => assert!(*id < snapshot.state.world.regions.len()),
+                EventSubject::Settlement(id) => {
+                    assert!(
+                        snapshot
+                            .state
+                            .settlements
+                            .iter()
+                            .any(|settlement| settlement.id == *id)
+                    )
+                }
+                EventSubject::PopulationGroup(id) => assert!(
+                    snapshot
+                        .state
+                        .population_groups
+                        .iter()
+                        .any(|group| group.id == *id)
+                ),
+            }
+        }
+    }
 }
 
 #[test]
