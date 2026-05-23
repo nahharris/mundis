@@ -1,6 +1,6 @@
 use mundis_core::{
     config::{SimulationBias, SimulationConfig, WorldSize},
-    export::{render_markdown, render_text},
+    export::{render_json, render_markdown, render_text},
     simulation::{EventSeverity, Simulation, SimulationEvent, SimulationSeed},
     storage::SaveDatabase,
     world::World,
@@ -32,13 +32,49 @@ fn generated_world_is_connected_and_inspectable() {
 
     assert_eq!(world.regions.len(), 8);
     assert!(world.is_connected());
-    assert!(world.regions.iter().all(|region| !region.name.is_empty()));
-    assert!(
-        world
-            .regions
-            .iter()
-            .all(|region| !region.neighbors.is_empty())
-    );
+
+    for (expected_id, region) in world.regions.iter().enumerate() {
+        assert_eq!(region.id, expected_id);
+        assert!(!region.name.is_empty());
+        assert!(!region.resources.is_empty());
+        assert!(!region.neighbors.is_empty());
+        assert!(
+            region
+                .neighbors
+                .windows(2)
+                .all(|window| window[0] < window[1])
+        );
+        assert!(
+            region
+                .neighbors
+                .iter()
+                .all(|neighbor| *neighbor < world.regions.len())
+        );
+    }
+}
+
+#[test]
+fn simulation_events_reference_valid_months_and_snapshot_state() {
+    let config = SimulationConfig {
+        months: 18,
+        world: WorldSize { regions: 5 },
+        ..SimulationConfig::default()
+    };
+    let mut simulation = Simulation::new(config.clone(), SimulationSeed::from_u64(27));
+
+    let events = simulation.run_months(config.months);
+    let snapshot = simulation.snapshot();
+
+    assert_eq!(events.len(), config.months as usize);
+    for (index, event) in events.iter().enumerate() {
+        assert_eq!(event.id, index as u64 + 1);
+        assert_eq!(event.month, index as u32 + 1);
+        assert!(!event.tags.is_empty());
+        assert!(!event.summary.is_empty());
+    }
+    assert_eq!(snapshot.state.month, config.months);
+    assert_eq!(snapshot.state.event_count, config.months as u64);
+    assert!(snapshot.state.world.is_connected());
 }
 
 #[test]
@@ -68,6 +104,39 @@ fn markdown_is_a_renderer_over_structured_events() {
     assert!(markdown.starts_with("# Mundis Chronicle"));
     assert!(markdown.contains("## Year 1"));
     assert!(markdown.contains(&events[0].summary));
+}
+
+#[test]
+fn text_json_and_markdown_exports_are_stable_renderers() {
+    let events = vec![
+        SimulationEvent {
+            id: 1,
+            month: 1,
+            severity: EventSeverity::Note,
+            tags: vec!["population".to_string()],
+            summary: "Aruven stirred as terraces filled.".to_string(),
+        },
+        SimulationEvent {
+            id: 2,
+            month: 12,
+            severity: EventSeverity::Important,
+            tags: vec!["region".to_string(), "politics".to_string()],
+            summary: "Beltor reshaped its border customs.".to_string(),
+        },
+    ];
+
+    assert_eq!(
+        render_text(&events),
+        "Month 1: Aruven stirred as terraces filled.\nMonth 12: Beltor reshaped its border customs.\n"
+    );
+    assert_eq!(
+        render_markdown(&events),
+        "# Mundis Chronicle\n\n## Year 1\n- Month 1: Aruven stirred as terraces filled.\n- Month 12: Beltor reshaped its border customs.\n"
+    );
+    assert_eq!(
+        render_json(&events).expect("JSON renders"),
+        "[\n  {\n    \"id\": 1,\n    \"month\": 1,\n    \"severity\": \"note\",\n    \"tags\": [\n      \"population\"\n    ],\n    \"summary\": \"Aruven stirred as terraces filled.\"\n  },\n  {\n    \"id\": 2,\n    \"month\": 12,\n    \"severity\": \"important\",\n    \"tags\": [\n      \"region\",\n      \"politics\"\n    ],\n    \"summary\": \"Beltor reshaped its border customs.\"\n  }\n]"
+    );
 }
 
 #[test]
