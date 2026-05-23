@@ -1,0 +1,20 @@
+[workspace]
+members = ["crates/mundis-core", "crates/mundis-cli"]
+resolver = "2"
+
+[workspace.package]
+edition = "2024"
+license = "MIT"
+repository = "https://github.com/nahharris/mundis"
+
+[workspace.dependencies]
+anyhow = "1.0"
+bincode = { version = "2.0", features = ["serde"] }
+clap = { version = "4.5", features = ["derive"] }
+rand = "0.9"
+rand_chacha = "0.9"
+rusqlite = { version = "0.37", features = ["bundled"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+tempfile = "3.23"
+toml = "0.9"
