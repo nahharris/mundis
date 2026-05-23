@@ -3,8 +3,9 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
     civilization::{
-        Culture, CultureId, CultureTrait, Polity, PolityId, PolityStatus, Rivalry, RivalryId,
-        TradeLink,
+        Alliance, AllianceStatus, Culture, CultureId, CultureTrait, Institution, NamingTradition,
+        Polity, PolityId, PolityStatus, Rivalry, RivalryId, TradeLink, Treaty, TreatyTerm, War,
+        WarId, WarStatus,
     },
     config::{LivingHistoryConfig, SimulationConfig},
     world::{Biome, RegionId, Resource, World},
@@ -31,6 +32,9 @@ pub struct SimulationState {
     pub polities: Vec<Polity>,
     pub trade_links: Vec<TradeLink>,
     pub rivalries: Vec<Rivalry>,
+    pub alliances: Vec<Alliance>,
+    pub wars: Vec<War>,
+    pub treaties: Vec<Treaty>,
     pub event_count: u64,
 }
 
@@ -111,6 +115,14 @@ pub enum EventType {
     BorderTension,
     CultureDrift,
     PolityCollapse,
+    AllianceFormed,
+    WarDeclared,
+    WarEnded,
+    TreatySigned,
+    Assimilation,
+    Revolt,
+    PolityFragmented,
+    Succession,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -213,6 +225,9 @@ impl Simulation {
                 polities: Vec::new(),
                 trade_links: Vec::new(),
                 rivalries: Vec::new(),
+                alliances: Vec::new(),
+                wars: Vec::new(),
+                treaties: Vec::new(),
                 event_count: 0,
             },
         }
@@ -280,6 +295,12 @@ impl Simulation {
         self.expand_polities(events);
         self.form_trade_links(events);
         self.apply_border_tension(events);
+        self.form_alliances(events);
+        self.declare_wars(events);
+        self.progress_wars(events);
+        self.apply_assimilation(events);
+        self.apply_fragmentation(events);
+        self.apply_succession(events);
         self.apply_cultural_drift(events);
         self.collapse_unstable_polities(events);
     }
@@ -313,6 +334,9 @@ impl Simulation {
                 capital: settlement_id,
                 controlled_settlements: vec![settlement_id],
                 controlled_regions: vec![settlement.region],
+                institutions: institutions_for(&settlement, &self.state.world),
+                succession_count: 0,
+                parent: None,
                 cohesion: 100,
             });
             events.push(self.make_event(
@@ -362,11 +386,7 @@ impl Simulation {
                         .neighbors
                         .contains(&settlement.region)
                 });
-                if borders
-                    && self.pressure_per_mille(polity.capital) >= threshold
-                    && self.primary_culture_for_settlement(settlement.id)
-                        == Some(polity.primary_culture)
-                {
+                if borders && self.pressure_per_mille(polity.capital) >= threshold {
                     expansions.push((polity.id, settlement.id));
                 }
             }
@@ -397,7 +417,7 @@ impl Simulation {
                     EventSubject::Settlement(settlement_id),
                     EventSubject::Region(region),
                 ],
-                vec!["neighboring settlement shared culture and pressure".to_string()],
+                vec!["neighboring settlement was exposed to expansion pressure".to_string()],
                 vec![format!("{polity_name} claimed {settlement_name}")],
                 format!("{polity_name} expanded its institutions into {settlement_name}."),
             ));
@@ -481,6 +501,356 @@ impl Simulation {
                 format!(
                     "Border tension rose between {} and {}.",
                     self.state.polities[left].name, self.state.polities[right].name
+                ),
+            ));
+        }
+    }
+
+    fn form_alliances(&mut self, events: &mut Vec<SimulationEvent>) {
+        let interval = self.config.civilization.alliance_interval_months.max(1);
+        if self.state.month % interval != 0 {
+            return;
+        }
+        for (left, right) in self.neighboring_active_polity_pairs() {
+            if self.alliance_exists(left, right) || self.active_war_exists(left, right) {
+                continue;
+            }
+            if !self.trade_link_exists(left, right) && self.rivalry_tension(left, right) > 0 {
+                continue;
+            }
+            let cause = if self.trade_link_exists(left, right) {
+                "trade and low rivalry made cooperation useful"
+            } else {
+                "low rivalry made border cooperation useful"
+            };
+            let id = self.state.alliances.len();
+            self.state.alliances.push(Alliance {
+                id,
+                polities: ordered_pair(left, right),
+                status: AllianceStatus::Active,
+                formed_month: self.state.month,
+            });
+            events.push(self.make_event(
+                EventType::AllianceFormed,
+                EventSeverity::Important,
+                vec!["alliance".to_string(), "polity".to_string()],
+                vec![EventSubject::Polity(left), EventSubject::Polity(right)],
+                vec![cause.to_string()],
+                vec!["rivalry tension softened".to_string()],
+                format!(
+                    "{} and {} formed an alliance.",
+                    self.state.polities[left].name, self.state.polities[right].name
+                ),
+            ));
+        }
+    }
+
+    fn declare_wars(&mut self, events: &mut Vec<SimulationEvent>) {
+        let threshold = self.config.civilization.war_tension_threshold;
+        for (left, right) in self.neighboring_active_polity_pairs() {
+            let tension = self.rivalry_tension(left, right);
+            if tension < threshold
+                || self.active_alliance_exists(left, right)
+                || self.active_war_exists(left, right)
+            {
+                continue;
+            }
+            self.break_alliance(left, right);
+            let id = self.state.wars.len();
+            self.state.wars.push(War {
+                id,
+                polities: ordered_pair(left, right),
+                status: WarStatus::Active,
+                started_month: self.state.month,
+                ended_month: None,
+                tension_at_start: tension,
+                score: 0,
+            });
+            events.push(self.make_event(
+                EventType::WarDeclared,
+                EventSeverity::Important,
+                vec!["war".to_string(), "rivalry".to_string()],
+                vec![EventSubject::Polity(left), EventSubject::Polity(right)],
+                vec![format!("rivalry tension reached {tension}")],
+                vec!["war began between neighboring polities".to_string()],
+                format!(
+                    "{} and {} went to war after rivalry hardened.",
+                    self.state.polities[left].name, self.state.polities[right].name
+                ),
+            ));
+        }
+    }
+
+    fn progress_wars(&mut self, events: &mut Vec<SimulationEvent>) {
+        let interval = self.config.civilization.war_interval_months.max(1);
+        if self.state.month % interval != 0 {
+            return;
+        }
+        let active_wars = self
+            .state
+            .wars
+            .iter()
+            .filter(|war| war.status == WarStatus::Active)
+            .map(|war| war.id)
+            .collect::<Vec<_>>();
+        for war_id in active_wars {
+            let (left, right) = self.state.wars[war_id].polities;
+            if self.state.polities[left].status != PolityStatus::Active
+                || self.state.polities[right].status != PolityStatus::Active
+            {
+                self.end_war_after_collapse(war_id, events);
+                continue;
+            }
+            let pressure = self.pressure_per_mille(self.state.polities[left].capital)
+                + self.pressure_per_mille(self.state.polities[right].capital);
+            let increment = 10 + (pressure / 1_000) as i32;
+            self.state.wars[war_id].score += increment;
+            self.state.polities[left].cohesion -= 5;
+            self.state.polities[right].cohesion -= 5;
+            if self.state.wars[war_id].score >= self.config.civilization.war_end_score_threshold {
+                self.end_war_with_treaty(war_id, events);
+            }
+        }
+    }
+
+    fn end_war_with_treaty(&mut self, war_id: WarId, events: &mut Vec<SimulationEvent>) {
+        let (left, right) = self.state.wars[war_id].polities;
+        self.state.wars[war_id].status = WarStatus::Ended;
+        self.state.wars[war_id].ended_month = Some(self.state.month);
+        let treaty_id = self.state.treaties.len();
+        let mut terms = vec![TreatyTerm::Truce, TreatyTerm::Recognition];
+        if self.trade_link_exists(left, right) {
+            terms.push(TreatyTerm::TradeAccess);
+        }
+        self.state.treaties.push(Treaty {
+            id: treaty_id,
+            polities: ordered_pair(left, right),
+            war: Some(war_id),
+            terms: terms.clone(),
+            signed_month: self.state.month,
+        });
+        events.push(self.make_event(
+            EventType::WarEnded,
+            EventSeverity::Important,
+            vec!["war".to_string(), "treaty".to_string()],
+            vec![EventSubject::Polity(left), EventSubject::Polity(right)],
+            vec![format!(
+                "war score reached {}",
+                self.state.wars[war_id].score
+            )],
+            vec!["war ended in negotiated settlement".to_string()],
+            format!(
+                "{} and {} ended their war.",
+                self.state.polities[left].name, self.state.polities[right].name
+            ),
+        ));
+        events.push(self.make_event(
+            EventType::TreatySigned,
+            EventSeverity::Important,
+            vec!["treaty".to_string(), "war".to_string()],
+            vec![EventSubject::Polity(left), EventSubject::Polity(right)],
+            vec!["war exhaustion forced negotiation".to_string()],
+            vec![format!("treaty terms recorded as {:?}", terms)],
+            format!(
+                "{} and {} signed a treaty.",
+                self.state.polities[left].name, self.state.polities[right].name
+            ),
+        ));
+    }
+
+    fn end_war_after_collapse(&mut self, war_id: WarId, events: &mut Vec<SimulationEvent>) {
+        let (left, right) = self.state.wars[war_id].polities;
+        self.state.wars[war_id].status = WarStatus::Ended;
+        self.state.wars[war_id].ended_month = Some(self.state.month);
+        events.push(self.make_event(
+            EventType::WarEnded,
+            EventSeverity::Important,
+            vec!["war".to_string(), "collapse".to_string()],
+            vec![EventSubject::Polity(left), EventSubject::Polity(right)],
+            vec!["one side could no longer sustain active institutions".to_string()],
+            vec!["war ended without treaty after polity collapse".to_string()],
+            format!(
+                "The war between {} and {} ended after collapse broke the conflict.",
+                self.state.polities[left].name, self.state.polities[right].name
+            ),
+        ));
+    }
+
+    fn apply_assimilation(&mut self, events: &mut Vec<SimulationEvent>) {
+        let interval = self.config.civilization.assimilation_interval_months.max(1);
+        if self.state.month % interval != 0 {
+            return;
+        }
+        let mut assimilations = Vec::new();
+        for polity in self
+            .state
+            .polities
+            .iter()
+            .filter(|polity| polity.status == PolityStatus::Active)
+        {
+            for group in self.state.population_groups.iter().filter(|group| {
+                group.settlement.is_some_and(|settlement_id| {
+                    self.state.settlements[settlement_id].polity == Some(polity.id)
+                }) && group.culture.is_some()
+                    && group.culture != Some(polity.primary_culture)
+            }) {
+                assimilations.push((polity.id, group.id, group.culture.expect("culture")));
+            }
+        }
+        for (polity_id, group_id, old_culture) in assimilations {
+            if self.state.population_groups[group_id].culture == Some(old_culture) {
+                self.state.population_groups[group_id].culture =
+                    Some(self.state.polities[polity_id].primary_culture);
+                events.push(self.make_event(
+                    EventType::Assimilation,
+                    EventSeverity::Important,
+                    vec!["culture".to_string(), "assimilation".to_string()],
+                    vec![
+                        EventSubject::Polity(polity_id),
+                        EventSubject::PopulationGroup(group_id),
+                        EventSubject::Culture(old_culture),
+                        EventSubject::Culture(self.state.polities[polity_id].primary_culture),
+                    ],
+                    vec!["minority households lived under another polity".to_string()],
+                    vec!["population identity shifted without changing population".to_string()],
+                    format!(
+                        "{} adopted the dominant culture of {}.",
+                        self.state.population_groups[group_id].name,
+                        self.state.polities[polity_id].name
+                    ),
+                ));
+            }
+        }
+    }
+
+    fn apply_fragmentation(&mut self, events: &mut Vec<SimulationEvent>) {
+        let interval = self
+            .config
+            .civilization
+            .fragmentation_interval_months
+            .max(1);
+        if self.state.month % interval != 0 {
+            return;
+        }
+        let threshold = self.config.civilization.fragmentation_cohesion_threshold;
+        let candidates = self
+            .state
+            .polities
+            .iter()
+            .filter(|polity| {
+                polity.status == PolityStatus::Active
+                    && polity.cohesion <= threshold
+                    && polity.controlled_settlements.len() > 1
+            })
+            .map(|polity| polity.id)
+            .collect::<Vec<_>>();
+        for parent_id in candidates {
+            let Some(&settlement_id) = self.state.polities[parent_id]
+                .controlled_settlements
+                .iter()
+                .find(|settlement_id| **settlement_id != self.state.polities[parent_id].capital)
+            else {
+                continue;
+            };
+            let child_id = self.state.polities.len();
+            let region = self.state.settlements[settlement_id].region;
+            let child_culture = self
+                .primary_culture_for_settlement(settlement_id)
+                .unwrap_or(self.state.polities[parent_id].primary_culture);
+            self.state.settlements[settlement_id].polity = Some(child_id);
+            self.sync_polity_holdings_after_settlement_loss(parent_id);
+            self.state.polities.push(Polity {
+                id: child_id,
+                name: format!(
+                    "{} Free Compact",
+                    self.state.settlements[settlement_id].name
+                ),
+                status: PolityStatus::Active,
+                primary_culture: child_culture,
+                capital: settlement_id,
+                controlled_settlements: vec![settlement_id],
+                controlled_regions: vec![region],
+                institutions: vec![Institution::Council],
+                succession_count: 0,
+                parent: Some(parent_id),
+                cohesion: 120,
+            });
+            events.push(self.make_event(
+                EventType::Revolt,
+                EventSeverity::Important,
+                vec!["revolt".to_string(), "fragmentation".to_string()],
+                vec![
+                    EventSubject::Polity(parent_id),
+                    EventSubject::Polity(child_id),
+                    EventSubject::Settlement(settlement_id),
+                ],
+                vec![format!(
+                    "cohesion fell to {}",
+                    self.state.polities[parent_id].cohesion
+                )],
+                vec!["a border settlement rejected central authority".to_string()],
+                format!(
+                    "{} revolted against {}.",
+                    self.state.settlements[settlement_id].name, self.state.polities[parent_id].name
+                ),
+            ));
+            events.push(self.make_event(
+                EventType::PolityFragmented,
+                EventSeverity::Important,
+                vec!["polity".to_string(), "fragmentation".to_string()],
+                vec![
+                    EventSubject::Polity(parent_id),
+                    EventSubject::Polity(child_id),
+                    EventSubject::Region(region),
+                ],
+                vec!["revolt created a child polity".to_string()],
+                vec![format!(
+                    "{} became independent",
+                    self.state.polities[child_id].name
+                )],
+                format!(
+                    "{} fragmented from {}.",
+                    self.state.polities[child_id].name, self.state.polities[parent_id].name
+                ),
+            ));
+        }
+    }
+
+    fn apply_succession(&mut self, events: &mut Vec<SimulationEvent>) {
+        let interval = self.config.civilization.succession_interval_months.max(1);
+        if self.state.month % interval != 0 {
+            return;
+        }
+        let candidates = self
+            .state
+            .polities
+            .iter()
+            .filter(|polity| polity.status == PolityStatus::Active)
+            .map(|polity| polity.id)
+            .collect::<Vec<_>>();
+        for polity_id in candidates {
+            self.state.polities[polity_id].succession_count += 1;
+            if self.state.polities[polity_id]
+                .institutions
+                .contains(&Institution::TradeLeague)
+            {
+                self.state.polities[polity_id].cohesion += 2;
+            } else {
+                self.state.polities[polity_id].cohesion -= 5;
+            }
+            events.push(self.make_event(
+                EventType::Succession,
+                EventSeverity::Important,
+                vec!["succession".to_string(), "institution".to_string()],
+                vec![EventSubject::Polity(polity_id)],
+                vec!["institutional leadership changed".to_string()],
+                vec![format!(
+                    "succession count reached {}",
+                    self.state.polities[polity_id].succession_count
+                )],
+                format!(
+                    "{} passed through a succession.",
+                    self.state.polities[polity_id].name
                 ),
             ));
         }
@@ -651,6 +1021,52 @@ impl Simulation {
             .trade_links
             .iter()
             .any(|link| link.polities == pair)
+    }
+
+    fn alliance_exists(&self, left: PolityId, right: PolityId) -> bool {
+        let pair = ordered_pair(left, right);
+        self.state
+            .alliances
+            .iter()
+            .any(|alliance| alliance.polities == pair)
+    }
+
+    fn active_alliance_exists(&self, left: PolityId, right: PolityId) -> bool {
+        let pair = ordered_pair(left, right);
+        self.state
+            .alliances
+            .iter()
+            .any(|alliance| alliance.polities == pair && alliance.status == AllianceStatus::Active)
+    }
+
+    fn active_war_exists(&self, left: PolityId, right: PolityId) -> bool {
+        let pair = ordered_pair(left, right);
+        self.state
+            .wars
+            .iter()
+            .any(|war| war.polities == pair && war.status == WarStatus::Active)
+    }
+
+    fn break_alliance(&mut self, left: PolityId, right: PolityId) {
+        let pair = ordered_pair(left, right);
+        for alliance in self
+            .state
+            .alliances
+            .iter_mut()
+            .filter(|alliance| alliance.polities == pair)
+        {
+            alliance.status = AllianceStatus::Broken;
+        }
+    }
+
+    fn rivalry_tension(&self, left: PolityId, right: PolityId) -> i32 {
+        let pair = ordered_pair(left, right);
+        self.state
+            .rivalries
+            .iter()
+            .find(|rivalry| rivalry.polities == pair)
+            .map(|rivalry| rivalry.tension)
+            .unwrap_or(0)
     }
 
     fn complementary_resources(&self, left: PolityId, right: PolityId) -> Vec<Resource> {
@@ -1132,6 +1548,7 @@ fn initialize_living_history(
                 name: format!("{} Folk", region.name),
                 origin_region: region.id,
                 traits: traits_for(region),
+                naming: naming_for(region),
                 drift: 0,
             });
         }
@@ -1165,6 +1582,50 @@ fn traits_for(region: &crate::world::Region) -> Vec<CultureTrait> {
         CultureTrait::Riverine
     };
     vec![biome_trait, resource_trait]
+}
+
+fn naming_for(region: &crate::world::Region) -> NamingTradition {
+    let prefix = region
+        .name
+        .chars()
+        .take(3)
+        .collect::<String>()
+        .to_ascii_titlecase();
+    NamingTradition::PrefixSuffix {
+        starts: vec![prefix, "Ana".to_string(), "Bel".to_string()],
+        ends: vec!["mar".to_string(), "ven".to_string(), "tor".to_string()],
+    }
+}
+
+trait AsciiTitlecase {
+    fn to_ascii_titlecase(self) -> String;
+}
+
+impl AsciiTitlecase for String {
+    fn to_ascii_titlecase(mut self) -> String {
+        if let Some(first) = self.get_mut(0..1) {
+            first.make_ascii_uppercase();
+        }
+        self
+    }
+}
+
+fn institutions_for(settlement: &Settlement, world: &World) -> Vec<Institution> {
+    let region = &world.regions[settlement.region];
+    let mut institutions = vec![Institution::Council];
+    if region.resources.contains(&Resource::Copper) || region.resources.contains(&Resource::Horses)
+    {
+        institutions.push(Institution::MilitaryCommand);
+    } else if region.resources.contains(&Resource::Salt)
+        || region.resources.contains(&Resource::Fish)
+    {
+        institutions.push(Institution::TradeLeague);
+    } else if matches!(region.biome, Biome::Desert | Biome::Tundra) {
+        institutions.push(Institution::Chiefdom);
+    } else {
+        institutions.push(Institution::TempleAuthority);
+    }
+    institutions
 }
 
 fn initial_population(carrying_capacity: u32, settings: &LivingHistoryConfig) -> u64 {

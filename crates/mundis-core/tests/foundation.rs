@@ -1,5 +1,5 @@
 use mundis_core::{
-    civilization::PolityStatus,
+    civilization::{AllianceStatus, NamingTradition, PolityStatus, WarStatus},
     config::{
         CivilizationConfig, LivingHistoryConfig, SimulationBias, SimulationConfig, WorldSize,
     },
@@ -886,6 +886,291 @@ fn abandoned_settlements_leave_active_polity_regions_consistent() {
 }
 
 #[test]
+fn old_civilization_toml_parses_with_arc_defaults() {
+    let input = r#"
+months = 240
+bias = "plausible"
+
+[world]
+regions = 8
+
+[civilization]
+enabled = true
+polity_foundation_population = 500
+expansion_pressure_threshold_per_mille = 900
+trade_interval_months = 12
+tension_interval_months = 12
+cultural_drift_interval_months = 24
+collapse_cohesion_threshold = 0
+
+[living_history]
+initial_settlements = 2
+initial_population_per_mille = 250
+monthly_growth_per_mille = 8
+migration_pressure_threshold_per_mille = 1100
+decline_pressure_threshold_per_mille = 1600
+migrant_split_per_mille = 200
+
+[output]
+verbosity = "chronicle"
+"#;
+
+    let config = SimulationConfig::from_toml(input).expect("phase one config parses");
+
+    assert_eq!(config.civilization.alliance_interval_months, 24);
+    assert_eq!(config.civilization.war_interval_months, 12);
+    assert_eq!(config.civilization.assimilation_interval_months, 24);
+    assert_eq!(config.civilization.fragmentation_interval_months, 12);
+    assert_eq!(config.civilization.succession_interval_months, 120);
+    assert_eq!(config.civilization.war_tension_threshold, 60);
+}
+
+#[test]
+fn cultures_have_naming_traditions_and_polities_have_institutions() {
+    let config = SimulationConfig {
+        months: 1,
+        world: WorldSize { regions: 4 },
+        living_history: LivingHistoryConfig {
+            initial_settlements: 2,
+            initial_population_per_mille: 900,
+            monthly_growth_per_mille: 0,
+            ..LivingHistoryConfig::default()
+        },
+        civilization: CivilizationConfig {
+            polity_foundation_population: 100,
+            ..CivilizationConfig::default()
+        },
+        ..SimulationConfig::default()
+    };
+    let mut simulation = Simulation::new(config.clone(), SimulationSeed::from_u64(12));
+
+    simulation.run_months(config.months);
+    let snapshot = simulation.snapshot();
+
+    assert!(
+        snapshot
+            .state
+            .cultures
+            .iter()
+            .all(|culture| matches!(culture.naming, NamingTradition::PrefixSuffix { .. }))
+    );
+    assert!(
+        snapshot
+            .state
+            .polities
+            .iter()
+            .all(|polity| !polity.institutions.is_empty())
+    );
+}
+
+#[test]
+fn multi_century_civilization_run_explains_rise_conflict_treaty_and_collapse() {
+    let config = arc_heavy_config();
+    let mut simulation = Simulation::new(config.clone(), SimulationSeed::from_u64(5));
+
+    let events = simulation.run_months(config.months);
+    let snapshot = simulation.snapshot();
+
+    let founded = first_event_month(&events, EventType::PolityFounded);
+    let alliance = first_event_month(&events, EventType::AllianceFormed);
+    let war = first_event_month(&events, EventType::WarDeclared);
+    let treaty = first_event_month(&events, EventType::TreatySigned);
+    let assimilation = first_event_month(&events, EventType::Assimilation);
+    let fragmentation = first_event_month(&events, EventType::PolityFragmented);
+    let collapse = first_event_month(&events, EventType::PolityCollapse);
+
+    assert!(founded < war);
+    assert!(alliance >= founded);
+    assert!(war < treaty);
+    assert!(assimilation >= founded);
+    assert!(fragmentation >= founded);
+    assert!(collapse >= war);
+    assert!(!snapshot.state.alliances.is_empty());
+    assert!(!snapshot.state.wars.is_empty());
+    assert!(!snapshot.state.treaties.is_empty());
+}
+
+#[test]
+fn wars_start_from_high_rivalry_and_end_with_treaties() {
+    let config = arc_heavy_config();
+    let mut simulation = Simulation::new(config.clone(), SimulationSeed::from_u64(5));
+
+    let events = simulation.run_months(config.months);
+    let snapshot = simulation.snapshot();
+    let war = snapshot.state.wars.first().expect("war");
+
+    assert_eq!(war.status, WarStatus::Ended);
+    assert!(war.tension_at_start >= config.civilization.war_tension_threshold);
+    assert!(war.ended_month.is_some());
+    assert!(
+        events
+            .iter()
+            .any(|event| event.event_type == EventType::WarEnded)
+    );
+    assert!(
+        snapshot
+            .state
+            .treaties
+            .iter()
+            .any(|treaty| treaty.war == Some(war.id))
+    );
+}
+
+#[test]
+fn alliances_use_unique_active_polity_pairs() {
+    let config = arc_heavy_config();
+    let mut simulation = Simulation::new(config.clone(), SimulationSeed::from_u64(7));
+
+    simulation.run_months(config.months);
+    let snapshot = simulation.snapshot();
+    let mut pairs = std::collections::HashSet::new();
+
+    for alliance in &snapshot.state.alliances {
+        assert!(alliance.polities.0 < alliance.polities.1);
+        assert!(pairs.insert(alliance.polities));
+        assert!(alliance.polities.0 < snapshot.state.polities.len());
+        assert!(alliance.polities.1 < snapshot.state.polities.len());
+        assert!(matches!(
+            alliance.status,
+            AllianceStatus::Active | AllianceStatus::Broken
+        ));
+    }
+}
+
+#[test]
+fn assimilation_changes_culture_without_changing_total_population() {
+    let config = arc_heavy_config();
+    let mut simulation = Simulation::new(config.clone(), SimulationSeed::from_u64(9));
+    let initial_population = simulation.snapshot().state.total_population();
+
+    let events = simulation.run_months(config.months);
+    let snapshot = simulation.snapshot();
+
+    assert!(
+        events
+            .iter()
+            .any(|event| event.event_type == EventType::Assimilation)
+    );
+    assert_eq!(snapshot.state.total_population(), initial_population);
+}
+
+#[test]
+fn fragmentation_creates_child_polity_and_preserves_ownership() {
+    let config = arc_heavy_config();
+    let mut simulation = Simulation::new(config.clone(), SimulationSeed::from_u64(9));
+
+    let events = simulation.run_months(config.months);
+    let snapshot = simulation.snapshot();
+    let fragment = events
+        .iter()
+        .find(|event| event.event_type == EventType::PolityFragmented)
+        .expect("fragmentation event");
+    let child_id = fragment
+        .subjects
+        .iter()
+        .find_map(|subject| match subject {
+            EventSubject::Polity(id) if snapshot.state.polities[*id].parent.is_some() => Some(*id),
+            _ => None,
+        })
+        .expect("child polity subject");
+
+    assert!(snapshot.state.polities[child_id].parent.is_some());
+    if snapshot.state.polities[child_id].status == PolityStatus::Active {
+        assert!(
+            snapshot.state.polities[child_id]
+                .controlled_settlements
+                .iter()
+                .all(
+                    |settlement_id| snapshot.state.settlements[*settlement_id].polity
+                        == Some(child_id)
+                )
+        );
+    } else {
+        assert!(
+            snapshot
+                .state
+                .settlements
+                .iter()
+                .all(|settlement| settlement.polity != Some(child_id))
+        );
+    }
+}
+
+#[test]
+fn succession_events_increment_polity_succession_count() {
+    let config = arc_heavy_config();
+    let mut simulation = Simulation::new(config.clone(), SimulationSeed::from_u64(12));
+
+    let events = simulation.run_months(config.months);
+    let snapshot = simulation.snapshot();
+
+    assert!(
+        events
+            .iter()
+            .any(|event| event.event_type == EventType::Succession)
+    );
+    assert!(
+        snapshot
+            .state
+            .polities
+            .iter()
+            .any(|polity| polity.succession_count > 0)
+    );
+}
+
+#[test]
+fn active_wars_do_not_reference_collapsed_polities() {
+    let config = arc_heavy_config();
+    let mut simulation = Simulation::new(config.clone(), SimulationSeed::from_u64(5));
+
+    simulation.run_months(config.months);
+    let snapshot = simulation.snapshot();
+
+    for war in snapshot
+        .state
+        .wars
+        .iter()
+        .filter(|war| war.status == WarStatus::Active)
+    {
+        assert_eq!(
+            snapshot.state.polities[war.polities.0].status,
+            PolityStatus::Active
+        );
+        assert_eq!(
+            snapshot.state.polities[war.polities.1].status,
+            PolityStatus::Active
+        );
+    }
+}
+
+#[test]
+fn wars_ended_by_collapse_emit_closing_events() {
+    let config = arc_heavy_config();
+    let mut simulation = Simulation::new(config.clone(), SimulationSeed::from_u64(5));
+
+    let events = simulation.run_months(config.months);
+    let snapshot = simulation.snapshot();
+
+    for war in snapshot
+        .state
+        .wars
+        .iter()
+        .filter(|war| war.status == WarStatus::Ended && war.ended_month.is_some())
+    {
+        assert!(events.iter().any(|event| {
+            event.event_type == EventType::WarEnded
+                && event.month == war.ended_month.expect("ended month")
+                && event
+                    .subjects
+                    .contains(&EventSubject::Polity(war.polities.0))
+                && event
+                    .subjects
+                    .contains(&EventSubject::Polity(war.polities.1))
+        }));
+    }
+}
+
+#[test]
 fn config_round_trips_through_toml() {
     let config = SimulationConfig {
         months: 24,
@@ -1013,4 +1298,44 @@ fn opening_non_mundis_database_reports_clear_error() {
         .expect("open should reject non-Mundis db");
 
     assert!(error.to_string().contains("not a Mundis save database"));
+}
+
+fn arc_heavy_config() -> SimulationConfig {
+    SimulationConfig {
+        months: 240,
+        world: WorldSize { regions: 8 },
+        living_history: LivingHistoryConfig {
+            initial_settlements: 4,
+            initial_population_per_mille: 1_600,
+            monthly_growth_per_mille: 0,
+            migration_pressure_threshold_per_mille: 3_000,
+            decline_pressure_threshold_per_mille: 4_000,
+            migrant_split_per_mille: 0,
+        },
+        civilization: CivilizationConfig {
+            polity_foundation_population: 100,
+            trade_interval_months: 1,
+            tension_interval_months: 1,
+            cultural_drift_interval_months: 1,
+            alliance_interval_months: 1,
+            war_interval_months: 1,
+            assimilation_interval_months: 1,
+            fragmentation_interval_months: 1,
+            succession_interval_months: 12,
+            war_tension_threshold: 30,
+            fragmentation_cohesion_threshold: 85,
+            war_end_score_threshold: 30,
+            collapse_cohesion_threshold: -20,
+            ..CivilizationConfig::default()
+        },
+        ..SimulationConfig::default()
+    }
+}
+
+fn first_event_month(events: &[SimulationEvent], event_type: EventType) -> u32 {
+    events
+        .iter()
+        .find(|event| event.event_type == event_type)
+        .map(|event| event.month)
+        .unwrap_or_else(|| panic!("missing event {event_type:?}"))
 }
