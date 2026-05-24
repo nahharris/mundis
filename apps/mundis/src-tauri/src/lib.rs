@@ -233,6 +233,7 @@ fn list_world_saves() -> Result<Vec<WorldSaveEntry>, String> {
 fn record_world_opened(save_path: PathBuf) -> Result<(), String> {
     let paths = current_mundis_paths()?;
     ensure_mundis_layout(&paths)?;
+    let save_path = validate_world_save_path(&paths, &save_path)?;
     remember_world_opened(&paths, &save_path, unix_timestamp())?;
     log_backend_event(
         "backend.world.opened",
@@ -246,7 +247,9 @@ async fn create_simulation(
     app: AppHandle,
     input: CreateSimulationInput,
 ) -> Result<AtlasState, String> {
-    let save_path = input.save_path.clone();
+    let paths = current_mundis_paths()?;
+    ensure_mundis_layout(&paths)?;
+    let save_path = validate_world_save_path(&paths, &input.save_path)?;
     log_backend_event(
         "backend.simulation.create.start",
         Some(serde_json::json!({
@@ -265,7 +268,7 @@ async fn create_simulation(
         );
         let summary = service_create_simulation(
             CreateSimulationSettings {
-                save_path: input.save_path,
+                save_path: save_path.clone(),
                 seed: input.seed,
                 months: input.months,
                 regions: input.regions,
@@ -397,12 +400,15 @@ fn record_frontend_log(
 
 #[tauri::command]
 async fn get_atlas_state(save_path: String, month: u32) -> Result<AtlasState, String> {
+    let paths = current_mundis_paths()?;
+    ensure_mundis_layout(&paths)?;
+    let save_path = validate_world_save_path(&paths, Path::new(&save_path))?;
     log_backend_event(
         "backend.atlas.load.start",
         Some(serde_json::json!({ "save_path": save_path, "month": month })),
     );
     tauri::async_runtime::spawn_blocking(move || {
-        service_get_atlas_state(save_path.as_ref(), month).map_err(|error| error.to_string())
+        service_get_atlas_state(&save_path, month).map_err(|error| error.to_string())
     })
     .await
     .map_err(|error| error.to_string())?
@@ -418,6 +424,9 @@ async fn query_events(
     event_type: Option<String>,
     severity: Option<String>,
 ) -> Result<Vec<SimulationEvent>, String> {
+    let paths = current_mundis_paths()?;
+    ensure_mundis_layout(&paths)?;
+    let save_path = validate_world_save_path(&paths, Path::new(&save_path))?;
     log_backend_event(
         "backend.events.query.start",
         Some(serde_json::json!({
@@ -453,7 +462,7 @@ async fn query_events(
         };
 
         service_query_events(QueryEventsRequest {
-            save_path: save_path.into(),
+            save_path,
             query,
         })
         .map_err(|error| error.to_string())
@@ -468,9 +477,12 @@ async fn get_causal_chain(
     event_id: u64,
     depth: Option<u32>,
 ) -> Result<CausalChain, String> {
+    let paths = current_mundis_paths()?;
+    ensure_mundis_layout(&paths)?;
+    let save_path = validate_world_save_path(&paths, Path::new(&save_path))?;
     let depth = depth.unwrap_or(2);
     tauri::async_runtime::spawn_blocking(move || {
-        service_get_causal_chain(save_path.as_ref(), event_id, depth)
+        service_get_causal_chain(&save_path, event_id, depth)
             .map_err(|error| error.to_string())
     })
     .await
@@ -558,6 +570,36 @@ fn load_opened_worlds(paths: &MundisPaths) -> Vec<WorldOpenRecord> {
 
 fn path_key(path: &Path) -> String {
     path.to_string_lossy().to_string()
+}
+
+fn validate_world_save_path(paths: &MundisPaths, save_path: &Path) -> Result<PathBuf, String> {
+    if save_path.extension().and_then(|extension| extension.to_str()) != Some("mundis") {
+        return Err("save path must use the .mundis extension".to_string());
+    }
+
+    let saves_dir = paths
+        .saves_dir
+        .canonicalize()
+        .map_err(|error| error.to_string())?;
+
+    let resolved = if save_path.exists() {
+        save_path.canonicalize().map_err(|error| error.to_string())?
+    } else {
+        let Some(parent) = save_path.parent() else {
+            return Err("save path must include a parent directory".to_string());
+        };
+        let file_name = save_path
+            .file_name()
+            .ok_or_else(|| "save path must include a file name".to_string())?;
+        let parent = parent.canonicalize().map_err(|error| error.to_string())?;
+        parent.join(file_name)
+    };
+
+    if !resolved.starts_with(&saves_dir) {
+        return Err("save path must be inside the Mundis saves directory".to_string());
+    }
+
+    Ok(resolved)
 }
 
 fn log_backend_event(message: &str, context: Option<serde_json::Value>) {
@@ -667,13 +709,30 @@ fn display_name_from_stem(stem: &str) -> String {
 mod tests {
     use std::path::Path;
 
-    use super::{AppConfig, display_name_from_stem, mundis_paths_from_home, save_stem};
+    use super::{
+        AppConfig, display_name_from_stem, mundis_paths_from_home, save_stem,
+        validate_world_save_path,
+    };
 
     #[test]
     fn save_stem_normalizes_world_names_for_files() {
         assert_eq!(save_stem("  First Age!  ").expect("stem"), "first-age");
         assert_eq!(save_stem("World_42").expect("stem"), "world-42");
         assert!(save_stem(" ... ").is_err());
+    }
+
+    #[test]
+    fn validate_world_save_path_rejects_paths_outside_saves_dir() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let home = temp.path().join("home");
+        let paths = mundis_paths_from_home(&home);
+        std::fs::create_dir_all(&paths.saves_dir).expect("saves dir");
+
+        let allowed = paths.saves_dir.join("allowed.mundis");
+        assert!(validate_world_save_path(&paths, &allowed).is_ok());
+
+        let outside = temp.path().join("outside.mundis");
+        assert!(validate_world_save_path(&paths, &outside).is_err());
     }
 
     #[test]

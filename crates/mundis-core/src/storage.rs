@@ -1,6 +1,6 @@
 use std::{error::Error, path::Path};
 
-use rusqlite::{Connection, OptionalExtension, params};
+use rusqlite::{Connection, OptionalExtension, params, params_from_iter};
 
 use crate::{
     config::SimulationConfig,
@@ -23,7 +23,7 @@ impl SaveDatabase {
         seed: SimulationSeed,
     ) -> StorageResult<Self> {
         reject_existing_path(path)?;
-        let connection = Connection::open(path)?;
+        let connection = open_connection(path)?;
         let db = Self { connection };
         db.initialize_schema()?;
         db.store_metadata(config, seed, None, None)?;
@@ -38,7 +38,7 @@ impl SaveDatabase {
         scenario_toml: Option<&str>,
     ) -> StorageResult<Self> {
         reject_existing_path(path)?;
-        let connection = Connection::open(path)?;
+        let connection = open_connection(path)?;
         let db = Self { connection };
         db.initialize_schema()?;
         db.store_metadata(config, seed, base_config_toml, scenario_toml)?;
@@ -46,7 +46,7 @@ impl SaveDatabase {
     }
 
     pub fn open(path: &Path) -> StorageResult<Self> {
-        let connection = Connection::open(path)?;
+        let connection = open_connection(path)?;
         let db = Self { connection };
         let has_metadata_table = db
             .connection
@@ -80,41 +80,47 @@ impl SaveDatabase {
     }
 
     pub fn append_events(&self, events: &[SimulationEvent]) -> StorageResult<()> {
-        for event in events {
-            let payload = bincode::serde::encode_to_vec(event, bincode::config::standard())?;
-            let event_type = event_type_key(&event.event_type);
-            let severity = severity_key(&event.severity);
-            self.connection.execute(
+        let transaction = self.connection.unchecked_transaction()?;
+        {
+            let mut insert_event = transaction.prepare(
                 "INSERT INTO events (id, month, event_type, severity, summary, payload) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-                params![
+            )?;
+            let mut insert_tag = transaction
+                .prepare("INSERT INTO event_tags (event_id, tag) VALUES (?1, ?2)")?;
+            let mut insert_subject = transaction.prepare(
+                "INSERT INTO event_subjects (event_id, subject) VALUES (?1, ?2)",
+            )?;
+            let mut insert_link = transaction.prepare(
+                "INSERT INTO event_links (cause_id, effect_id) VALUES (?1, ?2)",
+            )?;
+
+            for event in events {
+                let payload = bincode::serde::encode_to_vec(event, bincode::config::standard())?;
+                let event_type = event_type_key(&event.event_type);
+                let severity = severity_key(&event.severity);
+                insert_event.execute(params![
                     event.id as i64,
                     event.month as i64,
                     event_type,
                     severity,
                     &event.summary,
                     payload
-                ],
-            )?;
-            for tag in &event.tags {
-                self.connection.execute(
-                    "INSERT INTO event_tags (event_id, tag) VALUES (?1, ?2)",
-                    params![event.id as i64, tag],
-                )?;
-            }
-            for subject in &event.subjects {
-                let subject = SubjectFilter::from(subject).key();
-                self.connection.execute(
-                    "INSERT INTO event_subjects (event_id, subject) VALUES (?1, ?2)",
-                    params![event.id as i64, subject],
-                )?;
-            }
-            for cause_id in &event.caused_by {
-                self.connection.execute(
-                    "INSERT INTO event_links (cause_id, effect_id) VALUES (?1, ?2)",
-                    params![*cause_id as i64, event.id as i64],
-                )?;
+                ])?;
+                for tag in &event.tags {
+                    insert_tag
+                        .execute(params![event.id as i64, tag])?;
+                }
+                for subject in &event.subjects {
+                    let subject = SubjectFilter::from(subject).key();
+                    insert_subject
+                        .execute(params![event.id as i64, subject])?;
+                }
+                for cause_id in &event.caused_by {
+                    insert_link.execute(params![*cause_id as i64, event.id as i64])?;
+                }
             }
         }
+        transaction.commit()?;
         Ok(())
     }
 
@@ -281,46 +287,60 @@ impl SaveDatabase {
     }
 
     pub fn query_events(&self, query: &HistoryQuery) -> StorageResult<Vec<SimulationEvent>> {
-        let events = self.load_events()?;
-        Ok(events
-            .into_iter()
-            .filter(|event| {
-                query
-                    .from_month
-                    .is_none_or(|from_month| event.month >= from_month)
-            })
-            .filter(|event| {
-                query
-                    .to_month
-                    .is_none_or(|to_month| event.month <= to_month)
-            })
-            .filter(|event| {
-                query
-                    .tag
-                    .as_ref()
-                    .is_none_or(|tag| event.tags.iter().any(|event_tag| event_tag == tag))
-            })
-            .filter(|event| {
-                query
-                    .event_type
-                    .as_ref()
-                    .is_none_or(|event_type| &event.event_type == event_type)
-            })
-            .filter(|event| {
-                query
-                    .severity
-                    .as_ref()
-                    .is_none_or(|severity| &event.severity == severity)
-            })
-            .filter(|event| {
-                query.subject.is_none_or(|subject| {
-                    event
-                        .subjects
-                        .iter()
-                        .any(|event_subject| SubjectFilter::from(event_subject) == subject)
-                })
-            })
-            .collect())
+        let mut sql = String::from("SELECT DISTINCT e.payload FROM events e");
+        if query.tag.is_some() {
+            sql.push_str(" INNER JOIN event_tags et ON et.event_id = e.id");
+        }
+        if query.subject.is_some() {
+            sql.push_str(" INNER JOIN event_subjects es ON es.event_id = e.id");
+        }
+
+        let mut conditions = Vec::new();
+        let mut bind_values: Vec<rusqlite::types::Value> = Vec::new();
+
+        if let Some(from_month) = query.from_month {
+            conditions.push("e.month >= ?");
+            bind_values.push((from_month as i64).into());
+        }
+        if let Some(to_month) = query.to_month {
+            conditions.push("e.month <= ?");
+            bind_values.push((to_month as i64).into());
+        }
+        if let Some(tag) = &query.tag {
+            conditions.push("et.tag = ?");
+            bind_values.push(tag.clone().into());
+        }
+        if let Some(subject) = query.subject {
+            conditions.push("es.subject = ?");
+            bind_values.push(subject.key().into());
+        }
+        if let Some(event_type) = &query.event_type {
+            conditions.push("e.event_type = ?");
+            bind_values.push(event_type_key(event_type).into());
+        }
+        if let Some(severity) = &query.severity {
+            conditions.push("e.severity = ?");
+            bind_values.push(severity_key(severity).into());
+        }
+
+        if !conditions.is_empty() {
+            sql.push_str(" WHERE ");
+            sql.push_str(&conditions.join(" AND "));
+        }
+        sql.push_str(" ORDER BY e.id ASC");
+
+        let mut statement = self.connection.prepare(&sql)?;
+        let rows = statement.query_map(params_from_iter(bind_values), |row| {
+            row.get::<_, Vec<u8>>(0)
+        })?;
+        let mut events = Vec::new();
+        for row in rows {
+            let payload = row?;
+            let (event, _) =
+                bincode::serde::decode_from_slice(&payload, bincode::config::standard())?;
+            events.push(event);
+        }
+        Ok(events)
     }
 
     pub fn entity_history(&self, subject: SubjectFilter) -> StorageResult<Vec<SimulationEvent>> {
@@ -441,6 +461,12 @@ impl SaveDatabase {
             )
             .optional()?)
     }
+}
+
+fn open_connection(path: &Path) -> StorageResult<Connection> {
+    let connection = Connection::open(path)?;
+    connection.execute_batch("PRAGMA foreign_keys = ON;")?;
+    Ok(connection)
 }
 
 fn reject_existing_path(path: &Path) -> StorageResult<()> {
