@@ -1,4 +1,3 @@
-use mundis_core::scenario::ScenarioConfig;
 use mundis_core::{
     civilization::{AllianceStatus, NamingTradition, PolityStatus, WarStatus},
     config::{
@@ -11,6 +10,10 @@ use mundis_core::{
     },
     storage::SaveDatabase,
     world::{Resource, World},
+};
+use mundis_core::{
+    history::{HistoryQuery, SubjectFilter, atlas_state},
+    scenario::ScenarioConfig,
 };
 
 #[test]
@@ -211,34 +214,377 @@ fn save_database_preserves_scenario_sources() {
 }
 
 #[test]
-fn save_database_clears_absent_scenario_sources_when_reused() {
+fn save_database_rejects_existing_save_paths() {
     let temp = tempfile::tempdir().expect("temp dir");
-    let path = temp.path().join("scenario.mundis");
+    let path = temp.path().join("existing.mundis");
     let config = SimulationConfig::default();
 
-    SaveDatabase::create_with_sources(
-        &path,
-        &config,
-        SimulationSeed::from_u64(99),
-        Some("months = 12\n"),
-        Some("[simulation]\nmonths = 3\n"),
-    )
-    .expect("create db with sources");
-    SaveDatabase::create_with_sources(&path, &config, SimulationSeed::from_u64(99), None, None)
-        .expect("reuse db without sources");
+    SaveDatabase::create(&path, &config, SimulationSeed::from_u64(99)).expect("create db");
+    let error = match SaveDatabase::create(&path, &config, SimulationSeed::from_u64(99)) {
+        Ok(_) => panic!("existing save path should be rejected"),
+        Err(error) => error.to_string(),
+    };
 
-    let reopened = SaveDatabase::open(&path).expect("open db");
+    assert!(error.contains("save database already exists"));
+}
+
+#[test]
+fn save_database_uses_clean_history_schema_version() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let path = temp.path().join("schema.mundis");
+    let config = SimulationConfig::default();
+
+    SaveDatabase::create(&path, &config, SimulationSeed::from_u64(99)).expect("create db");
+
+    let connection = rusqlite::Connection::open(&path).expect("open sqlite db");
+    let version: String = connection
+        .query_row(
+            "SELECT value FROM metadata WHERE key = 'schema_version'",
+            [],
+            |row| row.get(0),
+        )
+        .expect("schema version");
+    assert_eq!(version, "2");
+}
+
+#[test]
+fn old_save_schema_versions_are_rejected_without_migration() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let path = temp.path().join("old-schema.mundis");
+    let connection = rusqlite::Connection::open(&path).expect("create sqlite db");
+    connection
+        .execute_batch(
+            "
+            CREATE TABLE metadata (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+            INSERT INTO metadata (key, value) VALUES ('schema_version', '4');
+            ",
+        )
+        .expect("old schema metadata");
+    drop(connection);
+
+    let error = match SaveDatabase::open(&path) {
+        Ok(_) => panic!("old schema should be rejected"),
+        Err(error) => error.to_string(),
+    };
+
+    assert!(error.contains("unsupported save schema version 4"));
+}
+
+#[test]
+fn save_database_indexes_and_queries_events() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let path = temp.path().join("history.mundis");
+    let config = SimulationConfig {
+        months: 18,
+        ..arc_heavy_config()
+    };
+    let seed = SimulationSeed::from_u64(5);
+    let mut simulation = Simulation::new(config.clone(), seed);
+    let db = SaveDatabase::create(&path, &config, seed).expect("create db");
+    db.store_snapshot(&simulation.snapshot())
+        .expect("store month zero");
+
+    for _ in 0..config.months {
+        let events = simulation.tick_month();
+        db.append_events(&events).expect("append events");
+        db.store_snapshot(&simulation.snapshot())
+            .expect("store monthly snapshot");
+    }
+
+    let polity_events = db
+        .query_events(&HistoryQuery {
+            from_month: Some(1),
+            to_month: Some(config.months),
+            tag: Some("polity".to_string()),
+            event_type: None,
+            severity: Some(EventSeverity::Important),
+            subject: None,
+        })
+        .expect("query events");
+
+    assert!(!polity_events.is_empty());
+    assert!(polity_events.iter().all(|event| event.month >= 1));
+    assert!(
+        polity_events
+            .iter()
+            .all(|event| event.month <= config.months)
+    );
+    assert!(
+        polity_events
+            .iter()
+            .all(|event| event.tags.iter().any(|tag| tag == "polity"))
+    );
+    assert!(
+        polity_events
+            .iter()
+            .all(|event| event.severity == EventSeverity::Important)
+    );
+}
+
+#[test]
+fn save_database_loads_exact_state_at_month() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let path = temp.path().join("state.mundis");
+    let config = SimulationConfig {
+        months: 8,
+        ..SimulationConfig::default()
+    };
+    let seed = SimulationSeed::from_u64(27);
+    let mut simulation = Simulation::new(config.clone(), seed);
+    let db = SaveDatabase::create(&path, &config, seed).expect("create db");
+    db.store_snapshot(&simulation.snapshot())
+        .expect("store month zero");
+
+    let mut expected = None;
+    for _ in 0..config.months {
+        let events = simulation.tick_month();
+        db.append_events(&events).expect("append events");
+        let snapshot = simulation.snapshot();
+        if snapshot.state.month == 5 {
+            expected = Some(snapshot.clone());
+        }
+        db.store_snapshot(&snapshot)
+            .expect("store monthly snapshot");
+    }
+
     assert_eq!(
-        reopened
-            .load_base_config_source()
-            .expect("load base config source"),
-        None
+        db.load_snapshot_at_month(5).expect("load month 5"),
+        expected.expect("expected month 5")
+    );
+}
+
+#[test]
+fn sparse_snapshots_reconstruct_unstored_months() {
+    use mundis_core::{
+        config::HistoryConfig,
+        history::{reconstruct_state_at_month, should_store_snapshot},
+    };
+
+    let temp = tempfile::tempdir().expect("temp dir");
+    let path = temp.path().join("sparse.mundis");
+    let config = SimulationConfig {
+        months: 12,
+        history: HistoryConfig {
+            snapshot_interval_months: 4,
+        },
+        ..SimulationConfig::default()
+    };
+    let seed = SimulationSeed::from_u64(31);
+    let mut simulation = Simulation::new(config.clone(), seed);
+    let db = SaveDatabase::create(&path, &config, seed).expect("create db");
+    db.store_snapshot(&simulation.snapshot())
+        .expect("store month zero");
+
+    let mut expected = std::collections::BTreeMap::new();
+    expected.insert(0, simulation.snapshot());
+    for _ in 0..config.months {
+        let events = simulation.tick_month();
+        db.append_events(&events).expect("append events");
+        let snapshot = simulation.snapshot();
+        expected.insert(snapshot.state.month, snapshot.clone());
+        if should_store_snapshot(
+            snapshot.state.month,
+            config.months,
+            config.history.snapshot_interval_months,
+        ) {
+            db.store_snapshot(&snapshot).expect("store sparse snapshot");
+        }
+    }
+
+    for month in 0..=config.months {
+        let reconstructed =
+            reconstruct_state_at_month(&db, &config, month).expect("reconstruct month");
+        assert_eq!(
+            reconstructed.snapshot,
+            expected
+                .get(&month)
+                .unwrap_or_else(|| panic!("missing reference month {month}"))
+                .clone()
+        );
+    }
+}
+
+#[test]
+fn causal_chain_traverses_food_pressure_migration_same_month() {
+    let config = SimulationConfig {
+        months: 48,
+        living_history: LivingHistoryConfig {
+            initial_settlements: 2,
+            initial_population_per_mille: 1_400,
+            monthly_growth_per_mille: 0,
+            migration_pressure_threshold_per_mille: 900,
+            decline_pressure_threshold_per_mille: 4_000,
+            migrant_split_per_mille: 250,
+        },
+        ..SimulationConfig::default()
+    };
+    let seed = SimulationSeed::from_u64(88);
+    let mut simulation = Simulation::new(config.clone(), seed);
+    let events = simulation.run_months(config.months);
+
+    let migration = events
+        .iter()
+        .find(|event| {
+            event.event_type == EventType::Migration && event.caused_by.len() == 1
+        })
+        .expect("migration caused by food pressure");
+    let food_pressure_id = migration.caused_by[0];
+    assert_eq!(
+        events
+            .iter()
+            .find(|event| event.id == food_pressure_id)
+            .map(|event| &event.event_type),
+        Some(&EventType::FoodPressure)
+    );
+
+    let temp = tempfile::tempdir().expect("temp dir");
+    let path = temp.path().join("chain.mundis");
+    let db = SaveDatabase::create(&path, &config, seed).expect("create db");
+    db.append_events(&events).expect("append events");
+
+    let chain = db
+        .load_causal_chain(migration.id, 2)
+        .expect("load causal chain");
+    assert_eq!(chain.event.id, migration.id);
+    assert!(
+        chain
+            .causes
+            .iter()
+            .any(|event| event.id == food_pressure_id)
+    );
+    assert!(
+        chain
+            .effects
+            .iter()
+            .any(|event| event.event_type == EventType::SettlementFounded)
+    );
+}
+
+#[test]
+fn causal_chain_traverses_war_declared_to_treaty_multi_month() {
+    let config = arc_heavy_config();
+    let seed = SimulationSeed::from_u64(5);
+    let mut simulation = Simulation::new(config.clone(), seed);
+    let events = simulation.run_months(config.months);
+
+    let treaty = events
+        .iter()
+        .find(|event| event.event_type == EventType::TreatySigned && !event.caused_by.is_empty())
+        .expect("treaty linked to war ended");
+    let war_ended_id = treaty.caused_by[0];
+    let war_ended = events
+        .iter()
+        .find(|event| event.id == war_ended_id)
+        .expect("war ended event");
+    assert_eq!(war_ended.event_type, EventType::WarEnded);
+    assert!(!war_ended.caused_by.is_empty());
+    let war_declared = events
+        .iter()
+        .find(|event| event.id == war_ended.caused_by[0])
+        .expect("war declared event");
+    assert_eq!(war_declared.event_type, EventType::WarDeclared);
+    assert!(war_ended.month > war_declared.month);
+    assert!(treaty.month >= war_ended.month);
+
+    let temp = tempfile::tempdir().expect("temp dir");
+    let path = temp.path().join("war-chain.mundis");
+    let db = SaveDatabase::create(&path, &config, seed).expect("create db");
+    db.append_events(&events).expect("append events");
+
+    let chain = db
+        .load_causal_chain(treaty.id, 3)
+        .expect("load treaty chain");
+    assert!(
+        chain
+            .causes
+            .iter()
+            .any(|event| event.event_type == EventType::WarDeclared)
+    );
+}
+
+#[test]
+fn entity_history_filters_by_subject() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let path = temp.path().join("entity.mundis");
+    let config = arc_heavy_config();
+    let seed = SimulationSeed::from_u64(5);
+    let mut simulation = Simulation::new(config.clone(), seed);
+    let db = SaveDatabase::create(&path, &config, seed).expect("create db");
+
+    for _ in 0..config.months {
+        let events = simulation.tick_month();
+        db.append_events(&events).expect("append events");
+    }
+
+    let events = db
+        .entity_history(SubjectFilter::Polity(0))
+        .expect("entity history");
+
+    assert!(!events.is_empty());
+    assert!(
+        events
+            .iter()
+            .all(|event| event.subjects.contains(&EventSubject::Polity(0)))
+    );
+}
+
+#[test]
+fn atlas_state_projects_snapshot_for_ui() {
+    let config = SimulationConfig {
+        months: 3,
+        ..SimulationConfig::default()
+    };
+    let mut simulation = Simulation::new(config.clone(), SimulationSeed::from_u64(42));
+    simulation.run_months(config.months);
+
+    let atlas = atlas_state(&simulation.snapshot());
+
+    assert_eq!(atlas.month, config.months);
+    assert_eq!(
+        atlas.regions.len(),
+        simulation.snapshot().state.world.regions.len()
     );
     assert_eq!(
-        reopened
-            .load_scenario_source()
-            .expect("load scenario source"),
-        None
+        atlas.settlements.len(),
+        simulation.snapshot().state.settlements.len()
+    );
+    assert_eq!(atlas.population, simulation.snapshot().state.population);
+}
+
+#[test]
+fn atlas_state_exposes_region_population_and_settlement_status() {
+    let config = SimulationConfig {
+        months: 6,
+        world: WorldSize { regions: 2 },
+        living_history: LivingHistoryConfig {
+            initial_settlements: 2,
+            initial_population_per_mille: 3_000,
+            monthly_growth_per_mille: 0,
+            migration_pressure_threshold_per_mille: 1_050,
+            decline_pressure_threshold_per_mille: 1_100,
+            migrant_split_per_mille: 250,
+        },
+        ..SimulationConfig::default()
+    };
+    let mut simulation = Simulation::new(config.clone(), SimulationSeed::from_u64(5));
+    simulation.run_months(config.months);
+
+    let snapshot = simulation.snapshot();
+    let atlas = atlas_state(&snapshot);
+
+    assert_eq!(
+        atlas
+            .regions
+            .iter()
+            .map(|region| region.population)
+            .sum::<u64>(),
+        atlas.population
+    );
+    assert!(
+        atlas
+            .settlements
+            .iter()
+            .any(|settlement| settlement.status == SettlementStatus::Abandoned)
     );
 }
 
@@ -1426,6 +1772,7 @@ fn text_json_and_markdown_exports_are_stable_renderers() {
             subjects: vec![EventSubject::Region(0)],
             causes: vec!["seeded test".to_string()],
             consequences: vec!["terraces filled".to_string()],
+            caused_by: vec![],
             summary: "Aruven stirred as terraces filled.".to_string(),
         },
         SimulationEvent {
@@ -1437,6 +1784,7 @@ fn text_json_and_markdown_exports_are_stable_renderers() {
             subjects: vec![EventSubject::Region(1)],
             causes: vec!["border pressure".to_string()],
             consequences: vec!["customs changed".to_string()],
+            caused_by: vec![],
             summary: "Beltor reshaped its border customs.".to_string(),
         },
     ];
@@ -1451,7 +1799,7 @@ fn text_json_and_markdown_exports_are_stable_renderers() {
     );
     assert_eq!(
         render_json(&events).expect("JSON renders"),
-        "[\n  {\n    \"id\": 1,\n    \"month\": 1,\n    \"event_type\": \"settlement-growth\",\n    \"severity\": \"note\",\n    \"tags\": [\n      \"population\"\n    ],\n    \"subjects\": [\n      {\n        \"region\": 0\n      }\n    ],\n    \"causes\": [\n      \"seeded test\"\n    ],\n    \"consequences\": [\n      \"terraces filled\"\n    ],\n    \"summary\": \"Aruven stirred as terraces filled.\"\n  },\n  {\n    \"id\": 2,\n    \"month\": 12,\n    \"event_type\": \"food-pressure\",\n    \"severity\": \"important\",\n    \"tags\": [\n      \"region\",\n      \"politics\"\n    ],\n    \"subjects\": [\n      {\n        \"region\": 1\n      }\n    ],\n    \"causes\": [\n      \"border pressure\"\n    ],\n    \"consequences\": [\n      \"customs changed\"\n    ],\n    \"summary\": \"Beltor reshaped its border customs.\"\n  }\n]"
+        "[\n  {\n    \"id\": 1,\n    \"month\": 1,\n    \"event_type\": \"settlement-growth\",\n    \"severity\": \"note\",\n    \"tags\": [\n      \"population\"\n    ],\n    \"subjects\": [\n      {\n        \"region\": 0\n      }\n    ],\n    \"causes\": [\n      \"seeded test\"\n    ],\n    \"consequences\": [\n      \"terraces filled\"\n    ],\n    \"caused_by\": [],\n    \"summary\": \"Aruven stirred as terraces filled.\"\n  },\n  {\n    \"id\": 2,\n    \"month\": 12,\n    \"event_type\": \"food-pressure\",\n    \"severity\": \"important\",\n    \"tags\": [\n      \"region\",\n      \"politics\"\n    ],\n    \"subjects\": [\n      {\n        \"region\": 1\n      }\n    ],\n    \"causes\": [\n      \"border pressure\"\n    ],\n    \"consequences\": [\n      \"customs changed\"\n    ],\n    \"caused_by\": [],\n    \"summary\": \"Beltor reshaped its border customs.\"\n  }\n]"
     );
 }
 
@@ -1466,6 +1814,7 @@ fn markdown_handles_zero_month_events_without_underflowing() {
         subjects: vec![],
         causes: vec![],
         consequences: vec![],
+        caused_by: vec![],
         summary: "A malformed event still renders safely.".to_string(),
     }];
 

@@ -26,6 +26,7 @@ simulation, and read a detailed chronicle of the world that emerges.
 - SQLite save databases, one file per simulation.
 - Binary snapshot blobs for internal simulation state inside save databases.
 - Seeded RNG streams for reproducible world generation and history.
+- Tauri, Svelte, TypeScript, and PixiJS for the desktop Mundis game app.
 
 ## First Milestones
 
@@ -38,6 +39,7 @@ simulation, and read a detailed chronicle of the world that emerges.
 7. Structured history events and chronicle rendering.
 8. Markdown and JSON history exports.
 9. Determinism, invariant, and benchmark tests.
+10. History inspection, reconstruction, and graphical world browsing.
 
 ## Scenario Authoring
 
@@ -103,4 +105,40 @@ tags = ["origin"]
 regions = ["coast"]
 settlements = ["harbor"]
 cultures = ["mariners"]
+```
+
+## History Inspection
+
+Saved runs live in a single `.mundis` SQLite database per simulation. Mundis stores sparse
+monthly snapshots (month 0, every `history.snapshot_interval_months`, and the final month) and
+reconstructs any other month by replaying forward from the nearest snapshot.
+
+```powershell
+# Create a saved run
+cargo run -p mundis -- run --seed 42 --months 24 --save smoke.mundis --export markdown
+
+# Filter events
+cargo run -p mundis -- inspect events --save smoke.mundis --from 1 --to 12 --tag polity --export json
+
+# Reconstruct state at a month (including months without an exact snapshot)
+cargo run -p mundis -- inspect state --save smoke.mundis --month 12 --export json
+
+# Entity history (generic subject syntax)
+cargo run -p mundis -- inspect entity --save smoke.mundis --subject region:0
+
+# Entity aliases
+cargo run -p mundis -- inspect region --save smoke.mundis --id 0 --export json
+cargo run -p mundis -- inspect settlement --save smoke.mundis --id 1
+cargo run -p mundis -- inspect polity --save smoke.mundis --id 0
+cargo run -p mundis -- inspect culture --save smoke.mundis --id 0
+
+# Causal chain around a structured event link (use an event id from the save)
+cargo run -p mundis -- inspect chain --save smoke.mundis --event-id 12 --depth 2 --export json
+
+# Export the full chronicle from a save
+cargo run -p mundis -- replay smoke.mundis --export markdown
+```
+
+Subject filters use `region:0`, `settlement:1`, `polity:2`, `culture:3`, or
+`population-group:4`. Event types and severities match the kebab-case names used in JSON exports.
 ```

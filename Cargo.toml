@@ -1,5 +1,10 @@
 [workspace]
-members = ["crates/mundis-core", "crates/mundis-cli"]
+members = [
+    "crates/mundis-core",
+    "crates/mundis-app",
+    "crates/mundis-cli",
+    "apps/mundis/src-tauri",
+]
 resolver = "2"
 
 [workspace.package]
@@ -17,5 +22,7 @@ rand_chacha = "0.9"
 rusqlite = { version = "0.37", features = ["bundled"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
+tauri = "2.11.2"
+tauri-build = "2.5.1"
 tempfile = "3.23"
 toml = "0.9"

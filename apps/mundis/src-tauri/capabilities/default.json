@@ -1,0 +1,7 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "default",
+  "description": "Allows the main Mundis window to receive simulation progress events.",
+  "windows": ["main"],
+  "permissions": ["core:event:default"]
+}
