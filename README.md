@@ -26,6 +26,7 @@ simulation, and read a detailed chronicle of the world that emerges.
 - SQLite save databases, one file per simulation.
 - Binary snapshot blobs for internal simulation state inside save databases.
 - Seeded RNG streams for reproducible world generation and history.
+- Tauri, Svelte, TypeScript, and PixiJS for the desktop Mundis game app.
 
 ## First Milestones
 
@@ -38,6 +39,7 @@ simulation, and read a detailed chronicle of the world that emerges.
 7. Structured history events and chronicle rendering.
 8. Markdown and JSON history exports.
 9. Determinism, invariant, and benchmark tests.
+10. History inspection, reconstruction, and graphical world browsing.
 
 ## Scenario Authoring
 

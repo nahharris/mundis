@@ -315,8 +315,14 @@ impl Simulation {
 
     pub fn run_months(&mut self, months: u32) -> Vec<SimulationEvent> {
         let mut events = Vec::new();
-        events.append(&mut self.pending_events);
+        events.extend(self.drain_pending_events());
         events.extend((0..months).flat_map(|_| self.tick_month()));
+        events
+    }
+
+    pub fn drain_pending_events(&mut self) -> Vec<SimulationEvent> {
+        let mut events = Vec::new();
+        events.append(&mut self.pending_events);
         events
     }
 
