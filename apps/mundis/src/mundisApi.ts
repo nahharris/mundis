@@ -1,5 +1,12 @@
 import { invoke } from '@tauri-apps/api/core';
-import type { AppConfig, AtlasState, CreateSimulationInput, HistoryEvent, MundisPaths } from './types';
+import type {
+  AppConfig,
+  AtlasState,
+  CausalChain,
+  CreateSimulationInput,
+  HistoryEvent,
+  MundisPaths
+} from './types';
 
 export async function createSimulation(input: CreateSimulationInput): Promise<AtlasState> {
   return invoke<AtlasState>('create_simulation', { input });
@@ -7,6 +14,14 @@ export async function createSimulation(input: CreateSimulationInput): Promise<At
 
 export async function loadAtlasState(savePath: string, month: number): Promise<AtlasState> {
   return invoke<AtlasState>('get_atlas_state', { savePath, month });
+}
+
+export async function loadCausalChain(
+  savePath: string,
+  eventId: number,
+  depth = 2
+): Promise<CausalChain> {
+  return invoke<CausalChain>('get_causal_chain', { savePath, eventId, depth });
 }
 
 export async function loadEvents(savePath: string, fromMonth = 0, toMonth: number | null = null): Promise<HistoryEvent[]> {

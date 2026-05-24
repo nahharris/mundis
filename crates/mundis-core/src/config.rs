@@ -7,8 +7,20 @@ pub struct SimulationConfig {
     #[serde(default)]
     pub civilization: CivilizationConfig,
     pub living_history: LivingHistoryConfig,
+    #[serde(default)]
+    pub history: HistoryConfig,
     pub bias: SimulationBias,
     pub output: OutputConfig,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HistoryConfig {
+    #[serde(default = "default_snapshot_interval_months")]
+    pub snapshot_interval_months: u32,
+}
+
+fn default_snapshot_interval_months() -> u32 {
+    6
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -74,6 +86,14 @@ pub enum OutputVerbosity {
     Chronicle,
 }
 
+impl Default for HistoryConfig {
+    fn default() -> Self {
+        Self {
+            snapshot_interval_months: default_snapshot_interval_months(),
+        }
+    }
+}
+
 impl Default for SimulationConfig {
     fn default() -> Self {
         Self {
@@ -81,6 +101,7 @@ impl Default for SimulationConfig {
             world: WorldSize { regions: 6 },
             civilization: CivilizationConfig::default(),
             living_history: LivingHistoryConfig::default(),
+            history: HistoryConfig::default(),
             bias: SimulationBias::Plausible,
             output: OutputConfig {
                 verbosity: OutputVerbosity::Chronicle,

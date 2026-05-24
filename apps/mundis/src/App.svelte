@@ -339,6 +339,13 @@
     activeWorldTab = 'chronicle';
   }
 
+  function focusRelatedEvent(eventId: number) {
+    const related = events.find((event) => event.id === eventId);
+    if (related) {
+      selectEvent(related);
+    }
+  }
+
   function groupEventsByMonth(sortedEvents: HistoryEvent[]): ChronicleMonth[] {
     const grouped: ChronicleMonth[] = [];
     for (const event of sortedEvents) {
@@ -898,6 +905,16 @@
                       <strong>Consequences</strong>
                       {#each selectedEvent.consequences as consequence}
                         <span>{consequence}</span>
+                      {/each}
+                    </div>
+                  {/if}
+                  {#if selectedEvent.caused_by?.length}
+                    <div class="event-detail-list">
+                      <strong>Related events</strong>
+                      {#each selectedEvent.caused_by as relatedId}
+                        <button type="button" class="related-event" onclick={() => focusRelatedEvent(relatedId)}>
+                          Event #{relatedId}
+                        </button>
                       {/each}
                     </div>
                   {/if}

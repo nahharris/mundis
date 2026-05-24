@@ -44,7 +44,14 @@ export type HistoryEvent = {
   subjects: unknown[];
   causes: string[];
   consequences: string[];
+  caused_by?: number[];
   summary: string;
+};
+
+export type CausalChain = {
+  event: HistoryEvent;
+  causes: HistoryEvent[];
+  effects: HistoryEvent[];
 };
 
 export type CreateSimulationInput = {

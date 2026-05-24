@@ -244,7 +244,7 @@ fn save_database_uses_clean_history_schema_version() {
             |row| row.get(0),
         )
         .expect("schema version");
-    assert_eq!(version, "1");
+    assert_eq!(version, "2");
 }
 
 #[test]
@@ -350,6 +350,155 @@ fn save_database_loads_exact_state_at_month() {
     assert_eq!(
         db.load_snapshot_at_month(5).expect("load month 5"),
         expected.expect("expected month 5")
+    );
+}
+
+#[test]
+fn sparse_snapshots_reconstruct_unstored_months() {
+    use mundis_core::{
+        config::HistoryConfig,
+        history::{reconstruct_state_at_month, should_store_snapshot},
+    };
+
+    let temp = tempfile::tempdir().expect("temp dir");
+    let path = temp.path().join("sparse.mundis");
+    let config = SimulationConfig {
+        months: 12,
+        history: HistoryConfig {
+            snapshot_interval_months: 4,
+        },
+        ..SimulationConfig::default()
+    };
+    let seed = SimulationSeed::from_u64(31);
+    let mut simulation = Simulation::new(config.clone(), seed);
+    let db = SaveDatabase::create(&path, &config, seed).expect("create db");
+    db.store_snapshot(&simulation.snapshot())
+        .expect("store month zero");
+
+    let mut expected = std::collections::BTreeMap::new();
+    expected.insert(0, simulation.snapshot());
+    for _ in 0..config.months {
+        let events = simulation.tick_month();
+        db.append_events(&events).expect("append events");
+        let snapshot = simulation.snapshot();
+        expected.insert(snapshot.state.month, snapshot.clone());
+        if should_store_snapshot(
+            snapshot.state.month,
+            config.months,
+            config.history.snapshot_interval_months,
+        ) {
+            db.store_snapshot(&snapshot).expect("store sparse snapshot");
+        }
+    }
+
+    for month in 0..=config.months {
+        let reconstructed =
+            reconstruct_state_at_month(&db, &config, month).expect("reconstruct month");
+        assert_eq!(
+            reconstructed.snapshot,
+            expected
+                .get(&month)
+                .unwrap_or_else(|| panic!("missing reference month {month}"))
+                .clone()
+        );
+    }
+}
+
+#[test]
+fn causal_chain_traverses_food_pressure_migration_same_month() {
+    let config = SimulationConfig {
+        months: 48,
+        living_history: LivingHistoryConfig {
+            initial_settlements: 2,
+            initial_population_per_mille: 1_400,
+            monthly_growth_per_mille: 0,
+            migration_pressure_threshold_per_mille: 900,
+            decline_pressure_threshold_per_mille: 4_000,
+            migrant_split_per_mille: 250,
+        },
+        ..SimulationConfig::default()
+    };
+    let seed = SimulationSeed::from_u64(88);
+    let mut simulation = Simulation::new(config.clone(), seed);
+    let events = simulation.run_months(config.months);
+
+    let migration = events
+        .iter()
+        .find(|event| {
+            event.event_type == EventType::Migration && event.caused_by.len() == 1
+        })
+        .expect("migration caused by food pressure");
+    let food_pressure_id = migration.caused_by[0];
+    assert_eq!(
+        events
+            .iter()
+            .find(|event| event.id == food_pressure_id)
+            .map(|event| &event.event_type),
+        Some(&EventType::FoodPressure)
+    );
+
+    let temp = tempfile::tempdir().expect("temp dir");
+    let path = temp.path().join("chain.mundis");
+    let db = SaveDatabase::create(&path, &config, seed).expect("create db");
+    db.append_events(&events).expect("append events");
+
+    let chain = db
+        .load_causal_chain(migration.id, 2)
+        .expect("load causal chain");
+    assert_eq!(chain.event.id, migration.id);
+    assert!(
+        chain
+            .causes
+            .iter()
+            .any(|event| event.id == food_pressure_id)
+    );
+    assert!(
+        chain
+            .effects
+            .iter()
+            .any(|event| event.event_type == EventType::SettlementFounded)
+    );
+}
+
+#[test]
+fn causal_chain_traverses_war_declared_to_treaty_multi_month() {
+    let config = arc_heavy_config();
+    let seed = SimulationSeed::from_u64(5);
+    let mut simulation = Simulation::new(config.clone(), seed);
+    let events = simulation.run_months(config.months);
+
+    let treaty = events
+        .iter()
+        .find(|event| event.event_type == EventType::TreatySigned && !event.caused_by.is_empty())
+        .expect("treaty linked to war ended");
+    let war_ended_id = treaty.caused_by[0];
+    let war_ended = events
+        .iter()
+        .find(|event| event.id == war_ended_id)
+        .expect("war ended event");
+    assert_eq!(war_ended.event_type, EventType::WarEnded);
+    assert!(!war_ended.caused_by.is_empty());
+    let war_declared = events
+        .iter()
+        .find(|event| event.id == war_ended.caused_by[0])
+        .expect("war declared event");
+    assert_eq!(war_declared.event_type, EventType::WarDeclared);
+    assert!(war_ended.month > war_declared.month);
+    assert!(treaty.month >= war_ended.month);
+
+    let temp = tempfile::tempdir().expect("temp dir");
+    let path = temp.path().join("war-chain.mundis");
+    let db = SaveDatabase::create(&path, &config, seed).expect("create db");
+    db.append_events(&events).expect("append events");
+
+    let chain = db
+        .load_causal_chain(treaty.id, 3)
+        .expect("load treaty chain");
+    assert!(
+        chain
+            .causes
+            .iter()
+            .any(|event| event.event_type == EventType::WarDeclared)
     );
 }
 
@@ -1623,6 +1772,7 @@ fn text_json_and_markdown_exports_are_stable_renderers() {
             subjects: vec![EventSubject::Region(0)],
             causes: vec!["seeded test".to_string()],
             consequences: vec!["terraces filled".to_string()],
+            caused_by: vec![],
             summary: "Aruven stirred as terraces filled.".to_string(),
         },
         SimulationEvent {
@@ -1634,6 +1784,7 @@ fn text_json_and_markdown_exports_are_stable_renderers() {
             subjects: vec![EventSubject::Region(1)],
             causes: vec!["border pressure".to_string()],
             consequences: vec!["customs changed".to_string()],
+            caused_by: vec![],
             summary: "Beltor reshaped its border customs.".to_string(),
         },
     ];
@@ -1648,7 +1799,7 @@ fn text_json_and_markdown_exports_are_stable_renderers() {
     );
     assert_eq!(
         render_json(&events).expect("JSON renders"),
-        "[\n  {\n    \"id\": 1,\n    \"month\": 1,\n    \"event_type\": \"settlement-growth\",\n    \"severity\": \"note\",\n    \"tags\": [\n      \"population\"\n    ],\n    \"subjects\": [\n      {\n        \"region\": 0\n      }\n    ],\n    \"causes\": [\n      \"seeded test\"\n    ],\n    \"consequences\": [\n      \"terraces filled\"\n    ],\n    \"summary\": \"Aruven stirred as terraces filled.\"\n  },\n  {\n    \"id\": 2,\n    \"month\": 12,\n    \"event_type\": \"food-pressure\",\n    \"severity\": \"important\",\n    \"tags\": [\n      \"region\",\n      \"politics\"\n    ],\n    \"subjects\": [\n      {\n        \"region\": 1\n      }\n    ],\n    \"causes\": [\n      \"border pressure\"\n    ],\n    \"consequences\": [\n      \"customs changed\"\n    ],\n    \"summary\": \"Beltor reshaped its border customs.\"\n  }\n]"
+        "[\n  {\n    \"id\": 1,\n    \"month\": 1,\n    \"event_type\": \"settlement-growth\",\n    \"severity\": \"note\",\n    \"tags\": [\n      \"population\"\n    ],\n    \"subjects\": [\n      {\n        \"region\": 0\n      }\n    ],\n    \"causes\": [\n      \"seeded test\"\n    ],\n    \"consequences\": [\n      \"terraces filled\"\n    ],\n    \"caused_by\": [],\n    \"summary\": \"Aruven stirred as terraces filled.\"\n  },\n  {\n    \"id\": 2,\n    \"month\": 12,\n    \"event_type\": \"food-pressure\",\n    \"severity\": \"important\",\n    \"tags\": [\n      \"region\",\n      \"politics\"\n    ],\n    \"subjects\": [\n      {\n        \"region\": 1\n      }\n    ],\n    \"causes\": [\n      \"border pressure\"\n    ],\n    \"consequences\": [\n      \"customs changed\"\n    ],\n    \"caused_by\": [],\n    \"summary\": \"Beltor reshaped its border customs.\"\n  }\n]"
     );
 }
 
@@ -1663,6 +1814,7 @@ fn markdown_handles_zero_month_events_without_underflowing() {
         subjects: vec![],
         causes: vec![],
         consequences: vec![],
+        caused_by: vec![],
         summary: "A malformed event still renders safely.".to_string(),
     }];
 

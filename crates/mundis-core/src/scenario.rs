@@ -620,6 +620,7 @@ impl ScenarioConfig {
                     subjects,
                     causes: vec!["authored scenario background".to_string()],
                     consequences: vec!["initial conditions were established".to_string()],
+                    caused_by: Vec::new(),
                     summary: event.summary.clone(),
                 })
             })

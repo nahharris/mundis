@@ -5,7 +5,10 @@ use anyhow::{Result, anyhow, bail};
 use mundis_core::{
     config::{SimulationBias, SimulationConfig},
     export::{render_json, render_markdown, render_text},
-    history::{AtlasState, HistoryQuery, SubjectFilter, atlas_state},
+    history::{
+        AtlasState, CausalChain, HistoryQuery, SubjectFilter, atlas_state, reconstruct_state_at_month,
+        should_store_snapshot,
+    },
     scenario::ScenarioConfig,
     simulation::{
         EventSeverity, EventType, Simulation, SimulationEvent, SimulationSeed, SimulationSnapshot,
@@ -162,11 +165,23 @@ pub fn entity_history(save_path: &Path, subject: SubjectFilter) -> AppResult<Vec
 
 pub fn get_state_at_month(save_path: &Path, month: u32) -> AppResult<SimulationSnapshot> {
     let db = convert_core_result(SaveDatabase::open(save_path))?;
-    convert_core_result(db.load_snapshot_at_month(month))
+    let config = convert_core_result(db.load_config())?;
+    let state =
+        convert_core_result(reconstruct_state_at_month(&db, &config, month))?;
+    Ok(state.snapshot)
 }
 
 pub fn get_atlas_state(save_path: &Path, month: u32) -> AppResult<AtlasState> {
     Ok(atlas_state(&get_state_at_month(save_path, month)?))
+}
+
+pub fn get_causal_chain(
+    save_path: &Path,
+    event_id: u64,
+    depth: u32,
+) -> AppResult<CausalChain> {
+    let db = convert_core_result(SaveDatabase::open(save_path))?;
+    convert_core_result(db.load_causal_chain(event_id, depth))
 }
 
 pub fn load_events(save_path: &Path) -> AppResult<Vec<SimulationEvent>> {
@@ -179,6 +194,44 @@ pub fn export_events(events: &[SimulationEvent], format: ExportFormat) -> AppRes
         ExportFormat::Text => Ok(render_text(events)),
         ExportFormat::Markdown => Ok(render_markdown(events)),
         ExportFormat::Json => Ok(render_json(events)?),
+    }
+}
+
+pub fn export_causal_chain(chain: &CausalChain, format: ExportFormat) -> AppResult<String> {
+    match format {
+        ExportFormat::Text => {
+            let mut output = format!("Event {}: {}\n", chain.event.id, chain.event.summary);
+            if !chain.causes.is_empty() {
+                output.push_str("\nCauses:\n");
+                for event in &chain.causes {
+                    output.push_str(&format!("- [{}] {}\n", event.id, event.summary));
+                }
+            }
+            if !chain.effects.is_empty() {
+                output.push_str("\nEffects:\n");
+                for event in &chain.effects {
+                    output.push_str(&format!("- [{}] {}\n", event.id, event.summary));
+                }
+            }
+            Ok(output)
+        }
+        ExportFormat::Markdown => {
+            let mut output = format!("# Event {}\n\n{}\n", chain.event.id, chain.event.summary);
+            if !chain.causes.is_empty() {
+                output.push_str("\n## Causes\n");
+                for event in &chain.causes {
+                    output.push_str(&format!("- [{}] {}\n", event.id, event.summary));
+                }
+            }
+            if !chain.effects.is_empty() {
+                output.push_str("\n## Effects\n");
+                for event in &chain.effects {
+                    output.push_str(&format!("- [{}] {}\n", event.id, event.summary));
+                }
+            }
+            Ok(output)
+        }
+        ExportFormat::Json => Ok(serde_json::to_string_pretty(chain)?),
     }
 }
 
@@ -270,10 +323,15 @@ fn run_and_save(
     }
     report_progress(save_path, simulation, events.len(), on_progress);
 
-    for _ in 0..simulation.config().months {
+    let interval = simulation.config().history.snapshot_interval_months;
+    let final_month = simulation.config().months;
+    for _ in 0..final_month {
         let month_events = simulation.tick_month();
         convert_core_result(db.append_events(&month_events))?;
-        convert_core_result(db.store_snapshot(&simulation.snapshot()))?;
+        let month = simulation.snapshot().state.month;
+        if should_store_snapshot(month, final_month, interval) {
+            convert_core_result(db.store_snapshot(&simulation.snapshot()))?;
+        }
         events.extend(month_events);
         report_progress(save_path, simulation, events.len(), on_progress);
     }

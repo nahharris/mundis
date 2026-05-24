@@ -4,11 +4,12 @@ use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use mundis_app::{
     CreateSimulationRequest, ExportFormat as AppExportFormat, QueryEventsRequest,
-    create_simulation, entity_history, export_events, export_snapshot, get_state_at_month,
-    load_events, parse_event_type, parse_severity, parse_subject, query_events,
+    create_simulation, entity_history, export_causal_chain, export_events, export_snapshot,
+    get_causal_chain, get_state_at_month, load_events, parse_event_type, parse_severity,
+    parse_subject, query_events,
 };
 use mundis_core::{
-    config::SimulationConfig, history::HistoryQuery, scenario::ScenarioConfig,
+    config::SimulationConfig, history::{HistoryQuery, SubjectFilter}, scenario::ScenarioConfig,
     simulation::SimulationSeed, world::World,
 };
 
@@ -96,6 +97,48 @@ enum InspectCommand {
         #[arg(long, value_enum, default_value_t = ExportFormat::Text)]
         export: ExportFormat,
     },
+    Chain {
+        #[arg(long)]
+        save: PathBuf,
+        #[arg(long)]
+        event_id: u64,
+        #[arg(long, default_value_t = 2)]
+        depth: u32,
+        #[arg(long, value_enum, default_value_t = ExportFormat::Text)]
+        export: ExportFormat,
+    },
+    Region {
+        #[arg(long)]
+        save: PathBuf,
+        #[arg(long)]
+        id: usize,
+        #[arg(long, value_enum, default_value_t = ExportFormat::Text)]
+        export: ExportFormat,
+    },
+    Settlement {
+        #[arg(long)]
+        save: PathBuf,
+        #[arg(long)]
+        id: usize,
+        #[arg(long, value_enum, default_value_t = ExportFormat::Text)]
+        export: ExportFormat,
+    },
+    Polity {
+        #[arg(long)]
+        save: PathBuf,
+        #[arg(long)]
+        id: usize,
+        #[arg(long, value_enum, default_value_t = ExportFormat::Text)]
+        export: ExportFormat,
+    },
+    Culture {
+        #[arg(long)]
+        save: PathBuf,
+        #[arg(long)]
+        id: usize,
+        #[arg(long, value_enum, default_value_t = ExportFormat::Text)]
+        export: ExportFormat,
+    },
 }
 
 fn main() -> Result<()> {
@@ -141,6 +184,24 @@ fn main() -> Result<()> {
                 subject,
                 export,
             } => inspect_entity(save, subject, export),
+            InspectCommand::Chain {
+                save,
+                event_id,
+                depth,
+                export,
+            } => inspect_chain(save, event_id, depth, export),
+            InspectCommand::Region { save, id, export } => {
+                inspect_entity_alias(save, SubjectFilter::Region(id), export)
+            }
+            InspectCommand::Settlement { save, id, export } => {
+                inspect_entity_alias(save, SubjectFilter::Settlement(id), export)
+            }
+            InspectCommand::Polity { save, id, export } => {
+                inspect_entity_alias(save, SubjectFilter::Polity(id), export)
+            }
+            InspectCommand::Culture { save, id, export } => {
+                inspect_entity_alias(save, SubjectFilter::Culture(id), export)
+            }
         },
         Command::Replay { save, export } => replay(save, export),
     }
@@ -251,8 +312,28 @@ fn inspect_state(save_path: PathBuf, month: u32, export: ExportFormat) -> Result
 
 fn inspect_entity(save_path: PathBuf, subject: String, export: ExportFormat) -> Result<()> {
     let subject = parse_subject(&subject).with_context(|| "failed to parse --subject")?;
+    inspect_entity_alias(save_path, subject, export)
+}
+
+fn inspect_entity_alias(
+    save_path: PathBuf,
+    subject: SubjectFilter,
+    export: ExportFormat,
+) -> Result<()> {
     let events = entity_history(&save_path, subject)?;
     print!("{}", export_events(&events, export.into())?);
+    Ok(())
+}
+
+fn inspect_chain(
+    save_path: PathBuf,
+    event_id: u64,
+    depth: u32,
+    export: ExportFormat,
+) -> Result<()> {
+    let chain = get_causal_chain(&save_path, event_id, depth)
+        .with_context(|| format!("failed to load causal chain for event {event_id}"))?;
+    print!("{}", export_causal_chain(&chain, export.into())?);
     Ok(())
 }
 

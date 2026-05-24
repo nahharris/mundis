@@ -8,12 +8,12 @@ use std::{
 use mundis_app::{
     CreateSimulationSettings, QueryEventsRequest, SimulationProgress,
     create_simulation_from_settings_with_progress as service_create_simulation,
-    get_atlas_state as service_get_atlas_state, parse_event_type, parse_severity, parse_subject,
-    query_events as service_query_events,
+    get_atlas_state as service_get_atlas_state, get_causal_chain as service_get_causal_chain,
+    parse_event_type, parse_severity, parse_subject, query_events as service_query_events,
 };
 use mundis_core::{
     config::SimulationBias,
-    history::{AtlasState, HistoryQuery},
+    history::{AtlasState, CausalChain, HistoryQuery},
     simulation::SimulationEvent,
 };
 use serde::{Deserialize, Serialize};
@@ -462,6 +462,21 @@ async fn query_events(
     .map_err(|error| error.to_string())?
 }
 
+#[tauri::command]
+async fn get_causal_chain(
+    save_path: String,
+    event_id: u64,
+    depth: Option<u32>,
+) -> Result<CausalChain, String> {
+    let depth = depth.unwrap_or(2);
+    tauri::async_runtime::spawn_blocking(move || {
+        service_get_causal_chain(save_path.as_ref(), event_id, depth)
+            .map_err(|error| error.to_string())
+    })
+    .await
+    .map_err(|error| error.to_string())?
+}
+
 pub fn run() {
     tauri::Builder::default()
         .invoke_handler(tauri::generate_handler![
@@ -475,7 +490,8 @@ pub fn run() {
             record_world_opened,
             record_frontend_log,
             get_atlas_state,
-            query_events
+            query_events,
+            get_causal_chain
         ])
         .run(tauri::generate_context!())
         .expect("error while running Mundis");

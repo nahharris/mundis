@@ -98,6 +98,8 @@ pub struct SimulationEvent {
     pub subjects: Vec<EventSubject>,
     pub causes: Vec<String>,
     pub consequences: Vec<String>,
+    #[serde(default)]
+    pub caused_by: Vec<u64>,
     pub summary: String,
 }
 
@@ -237,6 +239,15 @@ impl Simulation {
         }
     }
 
+    pub fn from_snapshot(config: SimulationConfig, snapshot: SimulationSnapshot) -> Self {
+        Self {
+            config,
+            seed: snapshot.seed,
+            state: snapshot.state,
+            pending_events: Vec::new(),
+        }
+    }
+
     pub fn from_compiled_scenario(compiled: CompiledScenario) -> Self {
         let population = compiled
             .population_groups
@@ -304,6 +315,7 @@ impl Simulation {
                 vec![],
                 vec!["no settlement changed enough to report in this month".to_string()],
                 vec!["history remained locally stable".to_string()],
+                &[],
                 "Settlements remained stable as local pressures balanced.".to_string(),
             ));
         }
@@ -405,6 +417,7 @@ impl Simulation {
                     "{} formed around {}",
                     self.state.polities[polity_id].name, settlement.name
                 )],
+                &[],
                 format!(
                     "{} formed as households in {} accepted shared institutions.",
                     self.state.polities[polity_id].name, settlement.name
@@ -466,6 +479,7 @@ impl Simulation {
                 ],
                 vec!["neighboring settlement was exposed to expansion pressure".to_string()],
                 vec![format!("{polity_name} claimed {settlement_name}")],
+                &[],
                 format!("{polity_name} expanded its institutions into {settlement_name}."),
             ));
         }
@@ -499,6 +513,7 @@ impl Simulation {
                 vec![EventSubject::Polity(left), EventSubject::Polity(right)],
                 vec!["neighboring polities held complementary resources".to_string()],
                 vec![format!("trade linked resources {:?}", resources)],
+                &[],
                 format!(
                     "{} and {} opened a trade link.",
                     self.state.polities[left].name, self.state.polities[right].name
@@ -545,6 +560,7 @@ impl Simulation {
                     "border pressure reached {pressure} combined per mille"
                 )],
                 vec![format!("rivalry {rivalry_id} intensified")],
+                &[],
                 format!(
                     "Border tension rose between {} and {}.",
                     self.state.polities[left].name, self.state.polities[right].name
@@ -584,6 +600,7 @@ impl Simulation {
                 vec![EventSubject::Polity(left), EventSubject::Polity(right)],
                 vec![cause.to_string()],
                 vec!["rivalry tension softened".to_string()],
+                &[],
                 format!(
                     "{} and {} formed an alliance.",
                     self.state.polities[left].name, self.state.polities[right].name
@@ -604,6 +621,19 @@ impl Simulation {
             }
             self.break_alliance(left, right);
             let id = self.state.wars.len();
+            let declared = self.make_event(
+                EventType::WarDeclared,
+                EventSeverity::Important,
+                vec!["war".to_string(), "rivalry".to_string()],
+                vec![EventSubject::Polity(left), EventSubject::Polity(right)],
+                vec![format!("rivalry tension reached {tension}")],
+                vec!["war began between neighboring polities".to_string()],
+                &[],
+                format!(
+                    "{} and {} went to war after rivalry hardened.",
+                    self.state.polities[left].name, self.state.polities[right].name
+                ),
+            );
             self.state.wars.push(War {
                 id,
                 polities: ordered_pair(left, right),
@@ -612,19 +642,9 @@ impl Simulation {
                 ended_month: None,
                 tension_at_start: tension,
                 score: 0,
+                declared_event_id: Some(declared.id),
             });
-            events.push(self.make_event(
-                EventType::WarDeclared,
-                EventSeverity::Important,
-                vec!["war".to_string(), "rivalry".to_string()],
-                vec![EventSubject::Polity(left), EventSubject::Polity(right)],
-                vec![format!("rivalry tension reached {tension}")],
-                vec!["war began between neighboring polities".to_string()],
-                format!(
-                    "{} and {} went to war after rivalry hardened.",
-                    self.state.polities[left].name, self.state.polities[right].name
-                ),
-            ));
+            events.push(declared);
         }
     }
 
@@ -676,7 +696,9 @@ impl Simulation {
             terms: terms.clone(),
             signed_month: self.state.month,
         });
-        events.push(self.make_event(
+        let war_declared_id = self.state.wars[war_id].declared_event_id;
+        let caused_by: Vec<u64> = war_declared_id.into_iter().collect();
+        let war_ended = self.make_event(
             EventType::WarEnded,
             EventSeverity::Important,
             vec!["war".to_string(), "treaty".to_string()],
@@ -686,11 +708,14 @@ impl Simulation {
                 self.state.wars[war_id].score
             )],
             vec!["war ended in negotiated settlement".to_string()],
+            &caused_by,
             format!(
                 "{} and {} ended their war.",
                 self.state.polities[left].name, self.state.polities[right].name
             ),
-        ));
+        );
+        let war_ended_id = war_ended.id;
+        events.push(war_ended);
         events.push(self.make_event(
             EventType::TreatySigned,
             EventSeverity::Important,
@@ -698,6 +723,7 @@ impl Simulation {
             vec![EventSubject::Polity(left), EventSubject::Polity(right)],
             vec!["war exhaustion forced negotiation".to_string()],
             vec![format!("treaty terms recorded as {:?}", terms)],
+            &[war_ended_id],
             format!(
                 "{} and {} signed a treaty.",
                 self.state.polities[left].name, self.state.polities[right].name
@@ -707,6 +733,8 @@ impl Simulation {
 
     fn end_war_after_collapse(&mut self, war_id: WarId, events: &mut Vec<SimulationEvent>) {
         let (left, right) = self.state.wars[war_id].polities;
+        let war_declared_id = self.state.wars[war_id].declared_event_id;
+        let caused_by: Vec<u64> = war_declared_id.into_iter().collect();
         self.state.wars[war_id].status = WarStatus::Ended;
         self.state.wars[war_id].ended_month = Some(self.state.month);
         events.push(self.make_event(
@@ -716,6 +744,7 @@ impl Simulation {
             vec![EventSubject::Polity(left), EventSubject::Polity(right)],
             vec!["one side could no longer sustain active institutions".to_string()],
             vec!["war ended without treaty after polity collapse".to_string()],
+            &caused_by,
             format!(
                 "The war between {} and {} ended after collapse broke the conflict.",
                 self.state.polities[left].name, self.state.polities[right].name
@@ -760,6 +789,7 @@ impl Simulation {
                     ],
                     vec!["minority households lived under another polity".to_string()],
                     vec!["population identity shifted without changing population".to_string()],
+                    &[],
                     format!(
                         "{} adopted the dominant culture of {}.",
                         self.state.population_groups[group_id].name,
@@ -822,7 +852,7 @@ impl Simulation {
                 parent: Some(parent_id),
                 cohesion: 120,
             });
-            events.push(self.make_event(
+            let revolt = self.make_event(
                 EventType::Revolt,
                 EventSeverity::Important,
                 vec!["revolt".to_string(), "fragmentation".to_string()],
@@ -836,11 +866,14 @@ impl Simulation {
                     self.state.polities[parent_id].cohesion
                 )],
                 vec!["a border settlement rejected central authority".to_string()],
+                &[],
                 format!(
                     "{} revolted against {}.",
                     self.state.settlements[settlement_id].name, self.state.polities[parent_id].name
                 ),
-            ));
+            );
+            let revolt_id = revolt.id;
+            events.push(revolt);
             events.push(self.make_event(
                 EventType::PolityFragmented,
                 EventSeverity::Important,
@@ -855,6 +888,7 @@ impl Simulation {
                     "{} became independent",
                     self.state.polities[child_id].name
                 )],
+                &[revolt_id],
                 format!(
                     "{} fragmented from {}.",
                     self.state.polities[child_id].name, self.state.polities[parent_id].name
@@ -895,6 +929,7 @@ impl Simulation {
                     "succession count reached {}",
                     self.state.polities[polity_id].succession_count
                 )],
+                &[],
                 format!(
                     "{} passed through a succession.",
                     self.state.polities[polity_id].name
@@ -934,6 +969,7 @@ impl Simulation {
                 vec![EventSubject::Culture(culture_id)],
                 vec![format!("culture spanned {} regions", regions.len())],
                 vec![format!("{culture_name} drift increased")],
+                &[],
                 format!("{culture_name} changed as its households spread between regions."),
             ));
         }
@@ -969,6 +1005,7 @@ impl Simulation {
                     self.state.polities[polity_id].cohesion
                 )],
                 vec![format!("{polity_name} released its settlements")],
+                &[],
                 format!("{polity_name} collapsed after its cohesion failed."),
             ));
         }
@@ -1204,6 +1241,7 @@ impl Simulation {
                 ],
                 vec!["monthly subsistence surplus".to_string()],
                 vec![format!("population increased by {total_growth}")],
+                &[],
                 format!(
                     "{} grew by {total_growth} people as local subsistence held.",
                     settlement.name
@@ -1228,7 +1266,7 @@ impl Simulation {
         }
 
         let settlement = self.state.settlements[settlement_id].clone();
-        events.push(self.make_event(
+        let food_pressure = self.make_event(
             EventType::FoodPressure,
             EventSeverity::Important,
             vec!["food-pressure".to_string(), "settlement".to_string()],
@@ -1240,16 +1278,25 @@ impl Simulation {
                 "food pressure reached {pressure} per mille of carrying capacity"
             )],
             vec!["migration pressure rose".to_string()],
+            &[],
             format!(
                 "Food pressure in {} rose above local carrying capacity.",
                 settlement.name
             ),
-        ));
+        );
+        let food_pressure_id = food_pressure.id;
+        events.push(food_pressure);
 
         if let Some(target_region) = self.open_neighbor_region(settlement.region) {
-            self.migrate_to_region(settlement_id, target_region, pressure, events);
+            self.migrate_to_region(
+                settlement_id,
+                target_region,
+                pressure,
+                food_pressure_id,
+                events,
+            );
         } else if pressure >= decline_threshold as u64 {
-            self.decline_settlement(settlement_id, pressure, events);
+            self.decline_settlement(settlement_id, pressure, food_pressure_id, events);
         }
     }
 
@@ -1294,6 +1341,7 @@ impl Simulation {
                 group.subsistence, region.biome
             )],
             vec![format!("{} lost {stress} stability", settlement.name)],
+            &[],
             format!(
                 "Seasonal stress in {} strained {} and weakened local stability.",
                 region.name, settlement.name
@@ -1306,6 +1354,7 @@ impl Simulation {
         origin_settlement_id: SettlementId,
         target_region: RegionId,
         pressure: u64,
+        food_pressure_id: u64,
         events: &mut Vec<SimulationEvent>,
     ) {
         let migrant_split = self.config.living_history.migrant_split_per_mille as u64;
@@ -1353,7 +1402,7 @@ impl Simulation {
             culture: self.state.population_groups[origin_group_id].culture,
         });
 
-        events.push(self.make_event(
+        let migration = self.make_event(
             EventType::Migration,
             EventSeverity::Important,
             vec!["migration".to_string(), "food-pressure".to_string()],
@@ -1365,12 +1414,15 @@ impl Simulation {
             ],
             vec![format!("food pressure reached {pressure} per mille")],
             vec![format!("{migrants} people moved into a neighboring region")],
+            &[food_pressure_id],
             format!(
                 "Food pressure pushed {migrants} people from {} toward {}.",
                 self.state.world.regions[origin_region].name,
                 self.state.world.regions[target_region].name
             ),
-        ));
+        );
+        let migration_id = migration.id;
+        events.push(migration);
         events.push(self.make_event(
             EventType::SettlementFounded,
             EventSeverity::Important,
@@ -1384,6 +1436,7 @@ impl Simulation {
             vec![format!(
                 "{settlement_name} was founded with {migrants} people"
             )],
+            &[migration_id],
             format!(
                 "{settlement_name} was founded in {} by migrant households.",
                 self.state.world.regions[target_region].name
@@ -1395,6 +1448,7 @@ impl Simulation {
         &mut self,
         settlement_id: SettlementId,
         pressure: u64,
+        food_pressure_id: u64,
         events: &mut Vec<SimulationEvent>,
     ) {
         let settlement = &mut self.state.settlements[settlement_id];
@@ -1419,6 +1473,7 @@ impl Simulation {
                 "no open neighboring region could absorb migrants".to_string(),
             ],
             vec![format!("{} entered decline", settlement.name)],
+            &[food_pressure_id],
             format!(
                 "{} began to decline as pressure mounted with no open neighboring region.",
                 settlement.name
@@ -1483,6 +1538,7 @@ impl Simulation {
                 format!("{} was abandoned", settlement.name),
                 format!("population loss of {population_loss} people"),
             ],
+            &[],
             format!(
                 "{} was abandoned after sustained pressure caused a population loss of {population_loss} people.",
                 settlement.name
@@ -1533,6 +1589,7 @@ impl Simulation {
         subjects: Vec<EventSubject>,
         causes: Vec<String>,
         consequences: Vec<String>,
+        caused_by: &[u64],
         summary: String,
     ) -> SimulationEvent {
         self.state.event_count += 1;
@@ -1545,6 +1602,7 @@ impl Simulation {
             subjects,
             causes,
             consequences,
+            caused_by: caused_by.to_vec(),
             summary,
         }
     }

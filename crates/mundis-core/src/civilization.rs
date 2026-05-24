@@ -117,6 +117,8 @@ pub struct War {
     pub ended_month: Option<u32>,
     pub tension_at_start: i32,
     pub score: i32,
+    #[serde(default)]
+    pub declared_event_id: Option<u64>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
