@@ -22,7 +22,7 @@ simulation, and read a detailed chronicle of the world that emerges.
 ## Technology
 
 - Rust workspace for the engine and CLI.
-- TOML for user-facing run configs and presets.
+- TOML for user-facing run configs, presets, and authored scenarios.
 - SQLite save databases, one file per simulation.
 - Binary snapshot blobs for internal simulation state inside save databases.
 - Seeded RNG streams for reproducible world generation and history.
@@ -38,3 +38,69 @@ simulation, and read a detailed chronicle of the world that emerges.
 7. Structured history events and chronicle rendering.
 8. Markdown and JSON history exports.
 9. Determinism, invariant, and benchmark tests.
+
+## Scenario Authoring
+
+Run configs tune the simulation. Scenario files can also author initial
+conditions, then let procedural generation fill anything omitted:
+
+```powershell
+cargo run -p mundis -- run --seed 42 --scenario scenario.toml --months 24 --export markdown
+```
+
+Scenarios can layer over a base config:
+
+```powershell
+cargo run -p mundis -- run --config base.toml --scenario scenario.toml
+```
+
+Precedence is `defaults < --config < scenario [simulation] < CLI flags`.
+
+Minimal scenario example:
+
+```toml
+[simulation]
+months = 24
+
+[simulation.world]
+regions = 3
+
+[[regions]]
+id = "coast"
+name = "Bright Coast"
+climate = "temperate"
+biome = "grassland"
+resources = ["fish", "salt"]
+carrying_capacity = 2500
+neighbors = ["hills"]
+
+[[regions]]
+id = "hills"
+name = "Copper Hills"
+climate = "arid"
+biome = "desert"
+resources = ["copper"]
+carrying_capacity = 900
+neighbors = ["coast"]
+
+[[cultures]]
+id = "mariners"
+name = "Mariners"
+origin_region = "coast"
+traits = ["maritime", "mercantile"]
+
+[[settlements]]
+id = "harbor"
+name = "First Harbor"
+region = "coast"
+culture = "mariners"
+population = 720
+
+[[background_events]]
+id = "landing"
+summary = "The first ships landed on Bright Coast."
+tags = ["origin"]
+regions = ["coast"]
+settlements = ["harbor"]
+cultures = ["mariners"]
+```

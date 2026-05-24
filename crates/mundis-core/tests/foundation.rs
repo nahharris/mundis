@@ -1,3 +1,4 @@
+use mundis_core::scenario::ScenarioConfig;
 use mundis_core::{
     civilization::{AllianceStatus, NamingTradition, PolityStatus, WarStatus},
     config::{
@@ -25,6 +26,220 @@ fn same_seed_and_config_produce_identical_events_and_snapshot() {
 
     assert_eq!(first_events, second_events);
     assert_eq!(first.snapshot(), second.snapshot());
+}
+
+#[test]
+fn scenario_simulation_overrides_base_config() {
+    let input = r#"
+        [simulation]
+        months = 18
+        bias = "harsh"
+
+        [simulation.world]
+        regions = 4
+
+        [simulation.civilization]
+        enabled = false
+
+        [simulation.living_history]
+        initial_settlements = 1
+    "#;
+    let scenario = ScenarioConfig::from_toml(input).expect("scenario parses");
+    let base = SimulationConfig {
+        months: 6,
+        world: WorldSize { regions: 9 },
+        bias: SimulationBias::Peaceful,
+        ..SimulationConfig::default()
+    };
+
+    let compiled = scenario
+        .compile(base, SimulationSeed::from_u64(10))
+        .expect("scenario compiles");
+
+    assert_eq!(compiled.config.months, 18);
+    assert_eq!(compiled.config.world.regions, 4);
+    assert_eq!(compiled.config.bias, SimulationBias::Harsh);
+    assert!(!compiled.config.civilization.enabled);
+    assert_eq!(compiled.config.living_history.initial_settlements, 1);
+}
+
+#[test]
+fn partial_scenario_authors_initial_state_and_fills_missing_regions() {
+    let input = r#"
+        [simulation.world]
+        regions = 3
+
+        [[regions]]
+        id = "coast"
+        name = "Bright Coast"
+        climate = "temperate"
+        biome = "grassland"
+        resources = ["fish", "salt"]
+        carrying_capacity = 2500
+        neighbors = ["hills"]
+
+        [[regions]]
+        id = "hills"
+        name = "Copper Hills"
+        climate = "arid"
+        biome = "desert"
+        resources = ["copper"]
+        carrying_capacity = 900
+        neighbors = ["coast"]
+
+        [[cultures]]
+        id = "mariners"
+        name = "Mariners"
+        origin_region = "coast"
+        traits = ["maritime", "mercantile"]
+
+        [[settlements]]
+        id = "harbor"
+        name = "First Harbor"
+        region = "coast"
+        stability = 88
+        culture = "mariners"
+        population = 720
+
+        [[background_events]]
+        id = "landing"
+        summary = "The first ships landed on Bright Coast."
+        tags = ["origin"]
+        regions = ["coast"]
+        settlements = ["harbor"]
+        cultures = ["mariners"]
+    "#;
+    let scenario = ScenarioConfig::from_toml(input).expect("scenario parses");
+
+    let compiled = scenario
+        .compile(SimulationConfig::default(), SimulationSeed::from_u64(10))
+        .expect("scenario compiles");
+    let mut simulation = Simulation::from_compiled_scenario(compiled);
+
+    let snapshot = simulation.snapshot();
+    assert_eq!(snapshot.state.world.regions.len(), 3);
+    assert_eq!(snapshot.state.world.regions[0].name, "Bright Coast");
+    assert_eq!(snapshot.state.world.regions[1].name, "Copper Hills");
+    assert_eq!(snapshot.state.settlements[0].name, "First Harbor");
+    assert_eq!(snapshot.state.settlements[0].stability, 88);
+    assert_eq!(snapshot.state.population_groups[0].population, 720);
+    assert_eq!(snapshot.state.cultures[0].name, "Mariners");
+
+    let events = simulation.run_months(1);
+    assert_eq!(events[0].month, 0);
+    assert_eq!(events[0].event_type, EventType::BackgroundEvent);
+    assert_eq!(events[0].summary, "The first ships landed on Bright Coast.");
+}
+
+#[test]
+fn scenario_rejects_unknown_references() {
+    let input = r#"
+        [[settlements]]
+        id = "harbor"
+        name = "First Harbor"
+        region = "missing"
+        population = 100
+    "#;
+    let scenario = ScenarioConfig::from_toml(input).expect("scenario parses");
+
+    let error = scenario
+        .compile(SimulationConfig::default(), SimulationSeed::from_u64(10))
+        .expect_err("scenario should reject bad references")
+        .to_string();
+
+    assert!(error.contains("settlement 'harbor'"));
+    assert!(error.contains("unknown region 'missing'"));
+}
+
+#[test]
+fn scenario_rejects_authored_cultures_without_authored_population_state() {
+    let input = r#"
+        [[regions]]
+        id = "coast"
+        name = "Bright Coast"
+        climate = "temperate"
+        biome = "grassland"
+        resources = ["fish"]
+        carrying_capacity = 2500
+
+        [[cultures]]
+        id = "mariners"
+        name = "Mariners"
+        origin_region = "coast"
+    "#;
+    let scenario = ScenarioConfig::from_toml(input).expect("scenario parses");
+
+    let error = scenario
+        .compile(SimulationConfig::default(), SimulationSeed::from_u64(10))
+        .expect_err("scenario should reject dangling authored cultures")
+        .to_string();
+
+    assert!(error.contains("authored cultures require authored settlements or population_groups"));
+}
+
+#[test]
+fn save_database_preserves_scenario_sources() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let path = temp.path().join("scenario.mundis");
+    let config = SimulationConfig::default();
+    let base_config_toml = "months = 12\n";
+    let scenario_toml = "[simulation]\nmonths = 3\n";
+
+    let db = SaveDatabase::create_with_sources(
+        &path,
+        &config,
+        SimulationSeed::from_u64(99),
+        Some(base_config_toml),
+        Some(scenario_toml),
+    )
+    .expect("create db");
+    drop(db);
+
+    let reopened = SaveDatabase::open(&path).expect("open db");
+    assert_eq!(
+        reopened
+            .load_base_config_source()
+            .expect("load base config source"),
+        Some(base_config_toml.to_string())
+    );
+    assert_eq!(
+        reopened
+            .load_scenario_source()
+            .expect("load scenario source"),
+        Some(scenario_toml.to_string())
+    );
+}
+
+#[test]
+fn save_database_clears_absent_scenario_sources_when_reused() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let path = temp.path().join("scenario.mundis");
+    let config = SimulationConfig::default();
+
+    SaveDatabase::create_with_sources(
+        &path,
+        &config,
+        SimulationSeed::from_u64(99),
+        Some("months = 12\n"),
+        Some("[simulation]\nmonths = 3\n"),
+    )
+    .expect("create db with sources");
+    SaveDatabase::create_with_sources(&path, &config, SimulationSeed::from_u64(99), None, None)
+        .expect("reuse db without sources");
+
+    let reopened = SaveDatabase::open(&path).expect("open db");
+    assert_eq!(
+        reopened
+            .load_base_config_source()
+            .expect("load base config source"),
+        None
+    );
+    assert_eq!(
+        reopened
+            .load_scenario_source()
+            .expect("load scenario source"),
+        None
+    );
 }
 
 #[test]
