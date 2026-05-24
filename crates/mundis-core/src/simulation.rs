@@ -8,6 +8,7 @@ use crate::{
         WarId, WarStatus,
     },
     config::{LivingHistoryConfig, SimulationConfig},
+    scenario::CompiledScenario,
     world::{Biome, RegionId, Resource, World},
 };
 
@@ -19,6 +20,7 @@ pub struct Simulation {
     config: SimulationConfig,
     seed: SimulationSeed,
     state: SimulationState,
+    pending_events: Vec<SimulationEvent>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -123,6 +125,7 @@ pub enum EventType {
     Revolt,
     PolityFragmented,
     Succession,
+    BackgroundEvent,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -230,6 +233,37 @@ impl Simulation {
                 treaties: Vec::new(),
                 event_count: 0,
             },
+            pending_events: Vec::new(),
+        }
+    }
+
+    pub fn from_compiled_scenario(compiled: CompiledScenario) -> Self {
+        let population = compiled
+            .population_groups
+            .iter()
+            .map(|group| group.population)
+            .sum();
+        let event_count = compiled.background_events.len() as u64;
+
+        Self {
+            config: compiled.config,
+            seed: compiled.seed,
+            state: SimulationState {
+                month: 0,
+                world: compiled.world,
+                population,
+                settlements: compiled.settlements,
+                population_groups: compiled.population_groups,
+                cultures: compiled.cultures,
+                polities: compiled.polities,
+                trade_links: Vec::new(),
+                rivalries: Vec::new(),
+                alliances: Vec::new(),
+                wars: Vec::new(),
+                treaties: Vec::new(),
+                event_count,
+            },
+            pending_events: compiled.background_events,
         }
     }
 
@@ -280,7 +314,10 @@ impl Simulation {
     }
 
     pub fn run_months(&mut self, months: u32) -> Vec<SimulationEvent> {
-        (0..months).flat_map(|_| self.tick_month()).collect()
+        let mut events = Vec::new();
+        events.append(&mut self.pending_events);
+        events.extend((0..months).flat_map(|_| self.tick_month()));
+        events
     }
 
     pub fn snapshot(&self) -> SimulationSnapshot {
@@ -288,6 +325,10 @@ impl Simulation {
             seed: self.seed,
             state: self.state.clone(),
         }
+    }
+
+    pub fn config(&self) -> &SimulationConfig {
+        &self.config
     }
 
     fn apply_civilization(&mut self, events: &mut Vec<SimulationEvent>) {
@@ -426,7 +467,7 @@ impl Simulation {
 
     fn form_trade_links(&mut self, events: &mut Vec<SimulationEvent>) {
         let interval = self.config.civilization.trade_interval_months.max(1);
-        if self.state.month % interval != 0 {
+        if !self.state.month.is_multiple_of(interval) {
             return;
         }
         for (left, right) in self.neighboring_active_polity_pairs() {
@@ -462,7 +503,7 @@ impl Simulation {
 
     fn apply_border_tension(&mut self, events: &mut Vec<SimulationEvent>) {
         let interval = self.config.civilization.tension_interval_months.max(1);
-        if self.state.month % interval != 0 {
+        if !self.state.month.is_multiple_of(interval) {
             return;
         }
         for (left, right) in self.neighboring_active_polity_pairs() {
@@ -508,7 +549,7 @@ impl Simulation {
 
     fn form_alliances(&mut self, events: &mut Vec<SimulationEvent>) {
         let interval = self.config.civilization.alliance_interval_months.max(1);
-        if self.state.month % interval != 0 {
+        if !self.state.month.is_multiple_of(interval) {
             return;
         }
         for (left, right) in self.neighboring_active_polity_pairs() {
@@ -583,7 +624,7 @@ impl Simulation {
 
     fn progress_wars(&mut self, events: &mut Vec<SimulationEvent>) {
         let interval = self.config.civilization.war_interval_months.max(1);
-        if self.state.month % interval != 0 {
+        if !self.state.month.is_multiple_of(interval) {
             return;
         }
         let active_wars = self
@@ -678,7 +719,7 @@ impl Simulation {
 
     fn apply_assimilation(&mut self, events: &mut Vec<SimulationEvent>) {
         let interval = self.config.civilization.assimilation_interval_months.max(1);
-        if self.state.month % interval != 0 {
+        if !self.state.month.is_multiple_of(interval) {
             return;
         }
         let mut assimilations = Vec::new();
@@ -729,7 +770,7 @@ impl Simulation {
             .civilization
             .fragmentation_interval_months
             .max(1);
-        if self.state.month % interval != 0 {
+        if !self.state.month.is_multiple_of(interval) {
             return;
         }
         let threshold = self.config.civilization.fragmentation_cohesion_threshold;
@@ -818,7 +859,7 @@ impl Simulation {
 
     fn apply_succession(&mut self, events: &mut Vec<SimulationEvent>) {
         let interval = self.config.civilization.succession_interval_months.max(1);
-        if self.state.month % interval != 0 {
+        if !self.state.month.is_multiple_of(interval) {
             return;
         }
         let candidates = self
@@ -862,7 +903,7 @@ impl Simulation {
             .civilization
             .cultural_drift_interval_months
             .max(1);
-        if self.state.month % interval != 0 {
+        if !self.state.month.is_multiple_of(interval) {
             return;
         }
         for culture_id in 0..self.state.cultures.len() {
@@ -1211,7 +1252,7 @@ impl Simulation {
         settlement_id: SettlementId,
         events: &mut Vec<SimulationEvent>,
     ) {
-        if self.state.month % 6 != 0 {
+        if !self.state.month.is_multiple_of(6) {
             return;
         }
 
@@ -1477,6 +1518,7 @@ impl Simulation {
             })
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn make_event(
         &mut self,
         event_type: EventType,
@@ -1511,7 +1553,7 @@ fn stress_for(biome: &Biome, subsistence: &SubsistenceMode) -> i32 {
     }
 }
 
-fn initialize_living_history(
+pub(crate) fn initialize_living_history(
     world: &World,
     config: &SimulationConfig,
 ) -> (Vec<Settlement>, Vec<PopulationGroup>, Vec<Culture>) {

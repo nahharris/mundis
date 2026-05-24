@@ -7,7 +7,7 @@ use crate::{
     simulation::{SimulationEvent, SimulationSeed, SimulationSnapshot},
 };
 
-const SCHEMA_VERSION: i64 = 4;
+const SCHEMA_VERSION: i64 = 5;
 
 pub type StorageResult<T> = Result<T, Box<dyn Error + Send + Sync>>;
 
@@ -24,7 +24,21 @@ impl SaveDatabase {
         let connection = Connection::open(path)?;
         let db = Self { connection };
         db.migrate()?;
-        db.store_metadata(config, seed)?;
+        db.store_metadata(config, seed, None, None)?;
+        Ok(db)
+    }
+
+    pub fn create_with_sources(
+        path: &Path,
+        config: &SimulationConfig,
+        seed: SimulationSeed,
+        base_config_toml: Option<&str>,
+        scenario_toml: Option<&str>,
+    ) -> StorageResult<Self> {
+        let connection = Connection::open(path)?;
+        let db = Self { connection };
+        db.migrate()?;
+        db.store_metadata(config, seed, base_config_toml, scenario_toml)?;
         Ok(db)
     }
 
@@ -126,6 +140,14 @@ impl SaveDatabase {
         Ok(SimulationConfig::from_toml(&config_toml)?)
     }
 
+    pub fn load_base_config_source(&self) -> StorageResult<Option<String>> {
+        self.load_optional_metadata("base_config_toml")
+    }
+
+    pub fn load_scenario_source(&self) -> StorageResult<Option<String>> {
+        self.load_optional_metadata("scenario_toml")
+    }
+
     fn migrate(&self) -> StorageResult<()> {
         self.connection.execute_batch(
             "
@@ -149,7 +171,13 @@ impl SaveDatabase {
         Ok(())
     }
 
-    fn store_metadata(&self, config: &SimulationConfig, seed: SimulationSeed) -> StorageResult<()> {
+    fn store_metadata(
+        &self,
+        config: &SimulationConfig,
+        seed: SimulationSeed,
+        base_config_toml: Option<&str>,
+        scenario_toml: Option<&str>,
+    ) -> StorageResult<()> {
         self.connection.execute(
             "INSERT OR REPLACE INTO metadata (key, value) VALUES ('schema_version', ?1)",
             params![SCHEMA_VERSION.to_string()],
@@ -162,6 +190,29 @@ impl SaveDatabase {
             "INSERT OR REPLACE INTO metadata (key, value) VALUES ('config_toml', ?1)",
             params![config.to_toml()?],
         )?;
+        if let Some(base_config_toml) = base_config_toml {
+            self.connection.execute(
+                "INSERT OR REPLACE INTO metadata (key, value) VALUES ('base_config_toml', ?1)",
+                params![base_config_toml],
+            )?;
+        }
+        if let Some(scenario_toml) = scenario_toml {
+            self.connection.execute(
+                "INSERT OR REPLACE INTO metadata (key, value) VALUES ('scenario_toml', ?1)",
+                params![scenario_toml],
+            )?;
+        }
         Ok(())
+    }
+
+    fn load_optional_metadata(&self, key: &str) -> StorageResult<Option<String>> {
+        Ok(self
+            .connection
+            .query_row(
+                "SELECT value FROM metadata WHERE key = ?1",
+                params![key],
+                |row| row.get(0),
+            )
+            .optional()?)
     }
 }
