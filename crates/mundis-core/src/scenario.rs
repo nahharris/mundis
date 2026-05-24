@@ -194,7 +194,15 @@ impl ScenarioConfig {
         let mut polities = Vec::new();
 
         let region_ids = self.region_ids(&world)?;
-        if !self.cultures.is_empty() || !self.settlements.is_empty() {
+        if !self.cultures.is_empty()
+            && self.settlements.is_empty()
+            && self.population_groups.is_empty()
+        {
+            return Err(ScenarioError::new(
+                "authored cultures require authored settlements or population_groups".to_string(),
+            ));
+        }
+        if !self.cultures.is_empty() {
             cultures = self.compile_cultures(&region_ids)?;
         }
         let culture_ids = ids_for(&cultures, self.cultures.iter().map(|culture| &culture.id));

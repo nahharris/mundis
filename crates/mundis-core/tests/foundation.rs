@@ -152,6 +152,32 @@ fn scenario_rejects_unknown_references() {
 }
 
 #[test]
+fn scenario_rejects_authored_cultures_without_authored_population_state() {
+    let input = r#"
+        [[regions]]
+        id = "coast"
+        name = "Bright Coast"
+        climate = "temperate"
+        biome = "grassland"
+        resources = ["fish"]
+        carrying_capacity = 2500
+
+        [[cultures]]
+        id = "mariners"
+        name = "Mariners"
+        origin_region = "coast"
+    "#;
+    let scenario = ScenarioConfig::from_toml(input).expect("scenario parses");
+
+    let error = scenario
+        .compile(SimulationConfig::default(), SimulationSeed::from_u64(10))
+        .expect_err("scenario should reject dangling authored cultures")
+        .to_string();
+
+    assert!(error.contains("authored cultures require authored settlements or population_groups"));
+}
+
+#[test]
 fn save_database_preserves_scenario_sources() {
     let temp = tempfile::tempdir().expect("temp dir");
     let path = temp.path().join("scenario.mundis");
@@ -181,6 +207,38 @@ fn save_database_preserves_scenario_sources() {
             .load_scenario_source()
             .expect("load scenario source"),
         Some(scenario_toml.to_string())
+    );
+}
+
+#[test]
+fn save_database_clears_absent_scenario_sources_when_reused() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let path = temp.path().join("scenario.mundis");
+    let config = SimulationConfig::default();
+
+    SaveDatabase::create_with_sources(
+        &path,
+        &config,
+        SimulationSeed::from_u64(99),
+        Some("months = 12\n"),
+        Some("[simulation]\nmonths = 3\n"),
+    )
+    .expect("create db with sources");
+    SaveDatabase::create_with_sources(&path, &config, SimulationSeed::from_u64(99), None, None)
+        .expect("reuse db without sources");
+
+    let reopened = SaveDatabase::open(&path).expect("open db");
+    assert_eq!(
+        reopened
+            .load_base_config_source()
+            .expect("load base config source"),
+        None
+    );
+    assert_eq!(
+        reopened
+            .load_scenario_source()
+            .expect("load scenario source"),
+        None
     );
 }
 

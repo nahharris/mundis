@@ -7,7 +7,7 @@ use crate::{
     simulation::{SimulationEvent, SimulationSeed, SimulationSnapshot},
 };
 
-const SCHEMA_VERSION: i64 = 5;
+const SCHEMA_VERSION: i64 = 4;
 
 pub type StorageResult<T> = Result<T, Box<dyn Error + Send + Sync>>;
 
@@ -190,17 +190,20 @@ impl SaveDatabase {
             "INSERT OR REPLACE INTO metadata (key, value) VALUES ('config_toml', ?1)",
             params![config.to_toml()?],
         )?;
-        if let Some(base_config_toml) = base_config_toml {
+        self.store_optional_metadata("base_config_toml", base_config_toml)?;
+        self.store_optional_metadata("scenario_toml", scenario_toml)?;
+        Ok(())
+    }
+
+    fn store_optional_metadata(&self, key: &str, value: Option<&str>) -> StorageResult<()> {
+        if let Some(value) = value {
             self.connection.execute(
-                "INSERT OR REPLACE INTO metadata (key, value) VALUES ('base_config_toml', ?1)",
-                params![base_config_toml],
+                "INSERT OR REPLACE INTO metadata (key, value) VALUES (?1, ?2)",
+                params![key, value],
             )?;
-        }
-        if let Some(scenario_toml) = scenario_toml {
-            self.connection.execute(
-                "INSERT OR REPLACE INTO metadata (key, value) VALUES ('scenario_toml', ?1)",
-                params![scenario_toml],
-            )?;
+        } else {
+            self.connection
+                .execute("DELETE FROM metadata WHERE key = ?1", params![key])?;
         }
         Ok(())
     }
